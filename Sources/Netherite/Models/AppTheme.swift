@@ -1,6 +1,7 @@
+import AppKit
 import SwiftUI
 
-enum AppTheme: String, CaseIterable, Identifiable, Codable {
+enum AppTheme: String, CaseIterable, Identifiable, Codable, Equatable {
     case system
     case light
     case dark
@@ -29,6 +30,17 @@ enum AppTheme: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    var appKitAppearanceName: NSAppearance.Name? {
+        switch self {
+        case .system:
+            nil
+        case .light:
+            .aqua
+        case .dark:
+            .darkAqua
+        }
+    }
+
     var systemImage: String {
         switch self {
         case .system:
@@ -38,5 +50,10 @@ enum AppTheme: String, CaseIterable, Identifiable, Codable {
         case .dark:
             "moon"
         }
+    }
+
+    @MainActor
+    func applyToApplication(_ application: NSApplication = .shared) {
+        application.appearance = appKitAppearanceName.flatMap(NSAppearance.init(named:))
     }
 }

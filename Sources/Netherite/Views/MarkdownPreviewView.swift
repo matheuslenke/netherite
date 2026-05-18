@@ -6,14 +6,44 @@ struct MarkdownPreviewView: View {
     let file: VaultFile?
     let isCompact: Bool
     let isEditable: Bool
+    var scrollSync: Binding<ScrollSyncState>?
+    var scrollTargetID: Binding<Int?>?
     @State private var focusedBlockStartOffset: Int?
+    @State private var markdownBlocks: [MarkdownBlock] = []
+    @State private var parsedMarkdownText = ""
+    @State private var parsedMarkdownIncludesEmptyLines = false
+    @State private var markdownParseTask: Task<Void, Never>?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
+        scrollablePreview
+            .glassEffect(.regular, in: Rectangle())
+            .onAppear {
+                scheduleMarkdownParse(delayNanoseconds: 0)
+            }
+            .onChange(of: text) { _, _ in
+                guard parsedMarkdownText != text || parsedMarkdownIncludesEmptyLines != isEditable else { return }
+                scheduleMarkdownParse()
+            }
+            .onChange(of: isEditable) { _, _ in
+                scheduleMarkdownParse(delayNanoseconds: 0)
+            }
+            .onChange(of: file?.id) { _, _ in
+                focusedBlockStartOffset = nil
+                scheduleMarkdownParse(delayNanoseconds: 0)
+            }
+            .onDisappear {
+                markdownParseTask?.cancel()
+            }
+    }
+
+    private var scrollablePreview: some View {
+        SynchronizedPreviewScrollView(
+            scrollSync: scrollSync,
+            scrollTargetID: scrollTargetID
+        ) {
+            LazyVStack(alignment: .leading, spacing: 10) {
                 if file?.kind == .markdown {
-                    let blocks = MarkdownBlock.parse(text, includeEmptyLines: isEditable)
-                    if blocks.isEmpty, isEditable {
+                    if markdownBlocks.isEmpty, isEditable {
                         EditableMarkdownField(
                             title: "Start writing",
                             text: $text,
@@ -22,10 +52,13 @@ struct MarkdownPreviewView: View {
                             onSlashCommand: applyCommandToWholeDocument
                         )
                     } else {
-                        ForEach(blocks) { block in
+                        ForEach(markdownBlocks) { block in
                             blockView(block)
+                                .id(block.sourceStartOffset)
                         }
                     }
+                } else if file?.fileExtension.lowercased() == "bib" {
+                    BibTeXPreviewView(text: text, isCompact: isCompact)
                 } else {
                     PlainPreviewEditor(text: $text, isEditable: isEditable)
                 }
@@ -33,12 +66,15 @@ struct MarkdownPreviewView: View {
             .padding(isCompact ? 16 : 24)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .glassEffect(.regular, in: Rectangle())
     }
 
     @ViewBuilder
     private func blockView(_ block: MarkdownBlock) -> some View {
         switch block.kind {
+        case let .properties(properties):
+            MarkdownPropertiesTable(properties: properties, isCompact: isCompact)
+                .padding(.bottom, 6)
+
         case let .heading(level):
             if isEditable {
                 EditableMarkdownField(
@@ -50,17 +86,33 @@ struct MarkdownPreviewView: View {
                     onSlashCommand: { applyCommand($0, to: block) },
                     onReturn: { insertNewBlock(after: block) }
                 )
+                .padding(.leading, 10)
                 .padding(.top, level == 1 ? 8 : 4)
+                .overlay(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(headingAccentColor(level).opacity(level == 1 ? 0.85 : 0.55))
+                        .frame(width: 3)
+                        .padding(.top, level == 1 ? 8 : 4)
+                }
             } else {
                 InlineMarkdownText(text: block.text)
+                    .equatable()
                     .font(.system(size: headingSize(level), weight: .semibold))
+                    .foregroundStyle(headingAccentColor(level))
+                    .padding(.leading, 10)
                     .padding(.top, level == 1 ? 8 : 4)
+                    .overlay(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(headingAccentColor(level).opacity(level == 1 ? 0.85 : 0.55))
+                            .frame(width: 3)
+                            .padding(.top, level == 1 ? 8 : 4)
+                    }
             }
 
         case .paragraph:
             if isEditable {
                 EditableMarkdownField(
-                    title: "Paragraph",
+                    title: "",
                     text: blockTextBinding(for: block),
                     focusID: block.sourceStartOffset,
                     focusedBlockStartOffset: $focusedBlockStartOffset,
@@ -71,6 +123,7 @@ struct MarkdownPreviewView: View {
                 )
             } else {
                 InlineMarkdownText(text: block.text)
+                    .equatable()
                     .font(.body)
                     .lineSpacing(4)
             }
@@ -78,7 +131,8 @@ struct MarkdownPreviewView: View {
         case .bullet:
             HStack(alignment: .top, spacing: 10) {
                 Text("•")
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(Color.accentColor)
                     .frame(width: 14)
 
                 if isEditable {
@@ -93,6 +147,7 @@ struct MarkdownPreviewView: View {
                     )
                 } else {
                     InlineMarkdownText(text: block.text)
+                        .equatable()
                         .lineSpacing(3)
                 }
             }
@@ -128,6 +183,7 @@ struct MarkdownPreviewView: View {
                     )
                 } else {
                     InlineMarkdownText(text: block.text)
+                        .equatable()
                         .lineSpacing(3)
                 }
             }
@@ -142,19 +198,28 @@ struct MarkdownPreviewView: View {
                     onSlashCommand: { applyCommand($0, to: block) },
                     onReturn: { insertNewBlock(after: block) }
                 )
-                .padding(.leading, 12)
+                .padding(.leading, 14)
+                .padding(.vertical, 8)
+                .padding(.trailing, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                 .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(.secondary.opacity(0.35))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.accentColor.opacity(0.65))
                         .frame(width: 3)
                 }
                 .foregroundStyle(.secondary)
             } else {
                 InlineMarkdownText(text: block.text)
-                    .padding(.leading, 12)
+                    .equatable()
+                    .padding(.leading, 14)
+                    .padding(.vertical, 8)
+                    .padding(.trailing, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                     .overlay(alignment: .leading) {
-                        Rectangle()
-                            .fill(.secondary.opacity(0.35))
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.accentColor.opacity(0.65))
                             .frame(width: 3)
                     }
                     .foregroundStyle(.secondary)
@@ -173,19 +238,40 @@ struct MarkdownPreviewView: View {
                 )
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
+                }
             } else {
                 Text(block.text)
                     .font(.system(size: 13, design: .monospaced))
                     .textSelection(.enabled)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                    .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
+                    }
             }
 
         case .rule:
             Divider()
                 .padding(.vertical, 8)
+        }
+    }
+
+    private func headingAccentColor(_ level: Int) -> Color {
+        switch level {
+        case 1:
+            Color.accentColor
+        case 2:
+            Color.cyan
+        case 3:
+            Color.orange
+        default:
+            Color.secondary
         }
     }
 
@@ -211,7 +297,9 @@ struct MarkdownPreviewView: View {
 
     private func applyCommandToWholeDocument(_ command: SlashCommand) {
         guard isEditable else { return }
-        text = command.style.markdownSource(for: commandContent(from: text))
+        let updatedText = command.style.markdownSource(for: commandContent(from: text))
+        text = updatedText
+        updateMarkdownBlocksImmediately(for: updatedText)
     }
 
     private func insertNewBlock(after block: MarkdownBlock) {
@@ -231,7 +319,7 @@ struct MarkdownPreviewView: View {
             "- [ ] "
         case .quote:
             "> "
-        case .heading, .paragraph, .code, .rule:
+        case .properties, .heading, .paragraph, .code, .rule:
             ""
         }
     }
@@ -259,11 +347,10 @@ struct MarkdownPreviewView: View {
     }
 
     private func currentBlock(matching block: MarkdownBlock) -> MarkdownBlock {
-        let blocks = MarkdownBlock.parse(text, includeEmptyLines: true)
-        if let sameOrdinal = blocks.first(where: { $0.ordinal == block.ordinal && $0.kind.editingShape == block.kind.editingShape }) {
+        if let sameOrdinal = markdownBlocks.first(where: { $0.ordinal == block.ordinal && $0.kind.editingShape == block.kind.editingShape }) {
             return sameOrdinal
         }
-        if let sameStart = blocks.first(where: { $0.sourceStartOffset == block.sourceStartOffset && $0.kind.editingShape == block.kind.editingShape }) {
+        if let sameStart = markdownBlocks.first(where: { $0.sourceStartOffset == block.sourceStartOffset && $0.kind.editingShape == block.kind.editingShape }) {
             return sameStart
         }
         return block
@@ -278,6 +365,7 @@ struct MarkdownPreviewView: View {
         let upperIndex = updatedText.index(updatedText.startIndex, offsetBy: upperOffset)
         updatedText.replaceSubrange(lowerIndex..<upperIndex, with: replacement)
         text = updatedText
+        updateMarkdownBlocksImmediately(for: updatedText)
     }
 
     private func headingSize(_ level: Int) -> CGFloat {
@@ -291,6 +379,298 @@ struct MarkdownPreviewView: View {
             19 + compactAdjustment
         default:
             16
+        }
+    }
+
+    private func scheduleMarkdownParse(delayNanoseconds requestedDelay: UInt64? = nil) {
+        markdownParseTask?.cancel()
+
+        guard file?.kind == .markdown else {
+            markdownBlocks = []
+            parsedMarkdownText = ""
+            parsedMarkdownIncludesEmptyLines = false
+            return
+        }
+
+        let source = text
+        let includeEmptyLines = isEditable
+        let delayNanoseconds = requestedDelay ?? (isEditable ? 0 : 90_000_000)
+
+        markdownParseTask = Task { @MainActor in
+            if delayNanoseconds > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                } catch {
+                    return
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            let parsedBlocks = await Task.detached(priority: .userInitiated) {
+                MarkdownBlock.parse(source, includeEmptyLines: includeEmptyLines)
+            }.value
+
+            guard !Task.isCancelled else { return }
+            markdownBlocks = parsedBlocks
+            parsedMarkdownText = source
+            parsedMarkdownIncludesEmptyLines = includeEmptyLines
+        }
+    }
+
+    private func updateMarkdownBlocksImmediately(for source: String) {
+        guard file?.kind == .markdown else { return }
+        markdownParseTask?.cancel()
+        markdownBlocks = MarkdownBlock.parse(source, includeEmptyLines: isEditable)
+        parsedMarkdownText = source
+        parsedMarkdownIncludesEmptyLines = isEditable
+    }
+}
+
+struct MarkdownTableOfContentsItem: Identifiable, Equatable, Sendable {
+    let id: Int
+    let level: Int
+    let title: String
+}
+
+struct MarkdownTableOfContentsView: View {
+    let items: [MarkdownTableOfContentsItem]
+    let selectedItemID: Int?
+    let isCompact: Bool
+    let onSelect: (MarkdownTableOfContentsItem) -> Void
+
+    var body: some View {
+        Group {
+            if isCompact {
+                compactBody
+            } else {
+                regularBody
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor), in: Rectangle())
+    }
+
+    private var regularBody: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider()
+
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(items) { item in
+                    regularRow(for: item)
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    private var compactBody: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 6) {
+                    ForEach(items) { item in
+                        compactRow(for: item)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+            }
+        }
+        .frame(height: 92)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Label("Contents", systemImage: "list.bullet.indent")
+                .font(.caption.weight(.semibold))
+
+            Text("\(items.count)")
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.accentColor.opacity(0.12), in: Capsule())
+
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, isCompact ? 10 : 12)
+        .padding(.vertical, 8)
+    }
+
+    private func regularRow(for item: MarkdownTableOfContentsItem) -> some View {
+        Button {
+            onSelect(item)
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: systemImage(for: item.level))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color(for: item.level))
+                    .frame(width: 16)
+
+                Text(item.title)
+                    .font(.caption)
+                    .foregroundStyle(selectedItemID == item.id ? Color.primary : Color.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, CGFloat(max(item.level - 1, 0)) * 10)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(rowBackground(for: item), in: RoundedRectangle(cornerRadius: 5))
+        }
+        .buttonStyle(.plain)
+        .help(item.title)
+        .accessibilityLabel("Jump to \(item.title)")
+    }
+
+    private func compactRow(for item: MarkdownTableOfContentsItem) -> some View {
+        Button {
+            onSelect(item)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Image(systemName: systemImage(for: item.level))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color(for: item.level))
+
+                Text(item.title)
+                    .font(.caption)
+                    .foregroundStyle(selectedItemID == item.id ? Color.primary : Color.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .frame(width: 132, height: 52, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(rowBackground(for: item), in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .help(item.title)
+        .accessibilityLabel("Jump to \(item.title)")
+    }
+
+    private func rowBackground(for item: MarkdownTableOfContentsItem) -> Color {
+        if selectedItemID == item.id {
+            return Color.accentColor.opacity(0.16)
+        }
+        return Color(nsColor: .textBackgroundColor).opacity(isCompact ? 0.65 : 0)
+    }
+
+    private func systemImage(for level: Int) -> String {
+        switch level {
+        case 1:
+            "textformat.size.larger"
+        case 2:
+            "textformat.size"
+        default:
+            "textformat"
+        }
+    }
+
+    private func color(for level: Int) -> Color {
+        switch level {
+        case 1:
+            Color.accentColor
+        case 2:
+            Color.cyan
+        case 3:
+            Color.orange
+        default:
+            Color.secondary
+        }
+    }
+}
+
+private struct SynchronizedPreviewScrollView<Content: View>: View {
+    var scrollSync: Binding<ScrollSyncState>?
+    var scrollTargetID: Binding<Int?>?
+    @ViewBuilder let content: Content
+    @State private var scrollPosition = ScrollPosition(edge: .top)
+    @State private var scrollMetrics = ScrollSyncMetrics.zero
+
+    init(
+        scrollSync: Binding<ScrollSyncState>?,
+        scrollTargetID: Binding<Int?>? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.scrollSync = scrollSync
+        self.scrollTargetID = scrollTargetID
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                content
+            }
+            .scrollPosition($scrollPosition)
+            .onScrollGeometryChange(for: ScrollSyncMetrics.self) { geometry in
+                SynchronizedScrolling.metrics(
+                    offset: geometry.contentOffset.y,
+                    contentLength: geometry.contentSize.height,
+                    viewportLength: geometry.containerSize.height
+                )
+            } action: { _, newMetrics in
+                DispatchQueue.main.async {
+                    scrollMetrics = newMetrics
+                    publishScrollProgress(newMetrics.progress)
+                }
+            }
+            .onChange(of: scrollSync?.wrappedValue) { _, newState in
+                applyRemoteScroll(newState)
+            }
+            .onChange(of: scrollMetrics.maxOffset) { _, _ in
+                applyRemoteScroll(scrollSync?.wrappedValue)
+            }
+            .onChange(of: scrollTargetID?.wrappedValue) { _, newTargetID in
+                applyScrollTarget(newTargetID, proxy: proxy)
+            }
+        }
+    }
+
+    private func publishScrollProgress(_ progress: CGFloat) {
+        guard let scrollSync else { return }
+
+        let currentState = scrollSync.wrappedValue
+        guard abs(currentState.progress - progress) > SynchronizedScrolling.progressTolerance else { return }
+
+        DispatchQueue.main.async {
+            let currentState = scrollSync.wrappedValue
+            guard abs(currentState.progress - progress) > SynchronizedScrolling.progressTolerance else { return }
+
+            scrollSync.wrappedValue = SynchronizedScrolling.nextState(
+                from: currentState,
+                source: .preview,
+                progress: progress
+            )
+        }
+    }
+
+    private func applyRemoteScroll(_ state: ScrollSyncState?) {
+        guard let state else {
+            return
+        }
+
+        let targetOffset = state.progress * scrollMetrics.maxOffset
+        guard abs(scrollMetrics.offset - targetOffset) > SynchronizedScrolling.offsetTolerance else { return }
+
+        scrollPosition.scrollTo(y: targetOffset)
+    }
+
+    private func applyScrollTarget(_ targetID: Int?, proxy: ScrollViewProxy) {
+        guard let targetID else { return }
+
+        proxy.scrollTo(targetID, anchor: .top)
+
+        if let scrollTargetID, scrollTargetID.wrappedValue == targetID {
+            scrollTargetID.wrappedValue = nil
         }
     }
 }
@@ -459,6 +839,9 @@ private struct ExpandingMarkdownTextView: NSViewRepresentable {
         }
 
         func textDidBeginEditing(_ notification: Notification) {
+            if let textView = notification.object as? NSTextView {
+                TextInsertionService.registerFocusedTextView(textView)
+            }
             parent.onFocus()
         }
 
@@ -559,7 +942,7 @@ private struct SlashCommandMenu: View {
     }
 }
 
-private struct InlineMarkdownText: View {
+private struct InlineMarkdownText: View, Equatable {
     let text: String
 
     var body: some View {
@@ -569,6 +952,137 @@ private struct InlineMarkdownText: View {
         } else {
             Text(text)
                 .textSelection(.enabled)
+        }
+    }
+}
+
+private struct MarkdownPropertiesTable: View {
+    let properties: [MarkdownProperty]
+    let isCompact: Bool
+
+    private var labelColumnWidth: CGFloat {
+        isCompact ? 104 : 140
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundStyle(Color.accentColor)
+
+                Text("Properties")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Text("\(properties.count)")
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            if properties.isEmpty {
+                Text("No properties")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+            } else {
+                ForEach(properties.indices, id: \.self) { index in
+                    MarkdownPropertyRow(
+                        property: properties[index],
+                        labelColumnWidth: labelColumnWidth
+                    )
+
+                    if index != properties.indices.last {
+                        Divider()
+                            .padding(.leading, labelColumnWidth)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
+        }
+        .textSelection(.enabled)
+    }
+}
+
+private struct MarkdownPropertyRow: View {
+    let property: MarkdownProperty
+    let labelColumnWidth: CGFloat
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: property.systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 14)
+
+                Text(property.name)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .frame(width: labelColumnWidth, alignment: .leading)
+
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(0.45))
+                .frame(width: 1)
+
+            MarkdownPropertyValueView(property: property)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct MarkdownPropertyValueView: View {
+    let property: MarkdownProperty
+
+    var body: some View {
+        if property.values.isEmpty {
+            Text("Empty")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+        } else if property.isList || property.values.count > 1 {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) {
+                    propertyChips
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    propertyChips
+                }
+            }
+        } else {
+            Text(property.values[0])
+                .font(.callout)
+                .foregroundStyle(.primary)
+        }
+    }
+
+    private var propertyChips: some View {
+        ForEach(Array(property.values.enumerated()), id: \.offset) { item in
+            Text(item.element)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Color.accentColor)
+                .lineLimit(1)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Color.accentColor.opacity(0.12), in: Capsule())
         }
     }
 }
@@ -684,8 +1198,114 @@ private enum MarkdownBlockStyle: Equatable {
     }
 }
 
-private struct MarkdownBlock: Identifiable {
-    enum Kind {
+struct MarkdownProperty: Identifiable, Sendable {
+    let id: String
+    let name: String
+    let values: [String]
+    let isList: Bool
+
+    var systemImage: String {
+        switch name.lowercased() {
+        case "title":
+            "textformat"
+        case "date", "created", "updated", "modified":
+            "calendar"
+        case "tags":
+            "tag"
+        case "aliases", "alias":
+            "link"
+        default:
+            "line.3.horizontal.decrease.circle"
+        }
+    }
+
+    static func parse(lines: [String]) -> [MarkdownProperty] {
+        struct Accumulator {
+            var name: String
+            var values: [String]
+            var isList: Bool
+        }
+
+        var properties: [Accumulator] = []
+        var currentPropertyIndex: Int?
+
+        for rawLine in lines {
+            let trimmedLine = rawLine.trimmed
+            guard !trimmedLine.isEmpty, !trimmedLine.hasPrefix("#") else { continue }
+
+            if rawLine.first == " " || rawLine.first == "\t" {
+                guard let currentPropertyIndex else { continue }
+                var listValue = trimmedLine
+                if listValue.hasPrefix("-") {
+                    listValue = String(listValue.dropFirst()).trimmed
+                }
+                guard !listValue.isEmpty else { continue }
+                properties[currentPropertyIndex].values.append(cleanValue(listValue))
+                properties[currentPropertyIndex].isList = true
+                continue
+            }
+
+            guard let colonIndex = rawLine.firstIndex(of: ":") else { continue }
+
+            let name = String(rawLine[..<colonIndex]).trimmed
+            guard !name.isEmpty else { continue }
+
+            let rawValue = String(rawLine[rawLine.index(after: colonIndex)...]).trimmed
+            let parsedValues = parseInlineValues(rawValue)
+            properties.append(
+                Accumulator(
+                    name: name,
+                    values: parsedValues,
+                    isList: rawValue.hasPrefix("[") && rawValue.hasSuffix("]")
+                )
+            )
+            currentPropertyIndex = properties.indices.last
+        }
+
+        return properties.enumerated().map { index, property in
+            MarkdownProperty(
+                id: "\(index)-\(property.name)",
+                name: property.name,
+                values: property.values,
+                isList: property.isList || property.values.count > 1
+            )
+        }
+    }
+
+    private static func parseInlineValues(_ rawValue: String) -> [String] {
+        guard !rawValue.isEmpty else { return [] }
+
+        if rawValue.hasPrefix("[") && rawValue.hasSuffix("]") {
+            let innerValue = rawValue.dropFirst().dropLast()
+            return innerValue
+                .split(separator: ",")
+                .map { cleanValue(String($0)) }
+                .filter { !$0.isEmpty }
+        }
+
+        return [cleanValue(rawValue)]
+    }
+
+    private static func cleanValue(_ rawValue: String) -> String {
+        let value = rawValue.trimmed
+        guard value.count >= 2 else { return value }
+
+        let first = value.first
+        let last = value.last
+        if first == "\"", last == "\"" {
+            return String(value.dropFirst().dropLast())
+        }
+        if first == "'", last == "'" {
+            return String(value.dropFirst().dropLast())
+        }
+
+        return value
+    }
+}
+
+struct MarkdownBlock: Identifiable, Sendable {
+    enum Kind: Sendable {
+        case properties([MarkdownProperty])
         case heading(level: Int)
         case paragraph
         case bullet
@@ -696,6 +1316,8 @@ private struct MarkdownBlock: Identifiable {
 
         var editingShape: String {
             switch self {
+            case .properties:
+                "properties"
             case .heading:
                 "heading"
             case .paragraph:
@@ -728,6 +1350,7 @@ private struct MarkdownBlock: Identifiable {
 
     static func parse(_ source: String, includeEmptyLines: Bool = false) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
+        let fragments = MarkdownLine.fragments(in: source)
         var paragraph: [String] = []
         var paragraphStartOffset: Int?
         var paragraphEndOffset: Int?
@@ -810,7 +1433,18 @@ private struct MarkdownBlock: Identifiable {
             resetCode()
         }
 
-        for fragment in MarkdownLine.fragments(in: source) {
+        var bodyStartIndex = fragments.startIndex
+        if let frontMatter = parseFrontMatter(in: fragments) {
+            appendBlock(
+                kind: .properties(frontMatter.properties),
+                text: "",
+                sourceStartOffset: frontMatter.sourceRange.lowerBound,
+                sourceRange: frontMatter.sourceRange
+            )
+            bodyStartIndex = frontMatter.bodyStartIndex
+        }
+
+        for fragment in fragments.dropFirst(bodyStartIndex) {
             let rawLine = fragment.text
             let leadingWhitespace = rawLine.prefix { $0 == " " || $0 == "\t" }.count
             let lineWithoutIndent = String(rawLine.dropFirst(leadingWhitespace))
@@ -967,9 +1601,37 @@ private struct MarkdownBlock: Identifiable {
 
         return blocks
     }
+
+    private static func parseFrontMatter(in fragments: [MarkdownLine]) -> MarkdownFrontMatter? {
+        guard let firstFragment = fragments.first,
+              firstFragment.text.trimmed == "---"
+        else {
+            return nil
+        }
+
+        for closingIndex in fragments.indices.dropFirst() {
+            guard fragments[closingIndex].text.trimmed == "---" else { continue }
+
+            let propertyLines = fragments[fragments.index(after: fragments.startIndex)..<closingIndex].map(\.text)
+            let closingFragment = fragments[closingIndex]
+            return MarkdownFrontMatter(
+                properties: MarkdownProperty.parse(lines: propertyLines),
+                sourceRange: firstFragment.lineStartOffset..<closingFragment.lineEndOffset,
+                bodyStartIndex: fragments.index(after: closingIndex)
+            )
+        }
+
+        return nil
+    }
 }
 
-private struct MarkdownLine {
+private struct MarkdownFrontMatter: Sendable {
+    let properties: [MarkdownProperty]
+    let sourceRange: Range<Int>
+    let bodyStartIndex: Int
+}
+
+private struct MarkdownLine: Sendable {
     let text: String
     let lineStartOffset: Int
     let lineEndOffset: Int

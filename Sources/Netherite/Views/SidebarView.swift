@@ -1,12 +1,17 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject private var store: VaultStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var confirmDelete: Bool
+    @Binding var sidebarVisible: Bool
     @State private var expandedFolders: Set<String> = []
     @State private var renamingNodeID: String?
     @State private var renameDraft = ""
+    @State private var isRootFileDropTargeted = false
+    @State private var refreshRotation = 0.0
 
     private var isSearching: Bool {
         !store.searchText.trimmed.isEmpty
@@ -32,29 +37,11 @@ struct SidebarView: View {
         VStack(spacing: 0) {
             sidebarHeader
 
-            List(selection: selectionBinding) {
-                if treeNodes.isEmpty {
-                    emptyTreeRow
-                } else {
-                    ForEach(treeNodes) { node in
-                        FileTreeRow(
-                            node: node,
-                            expandedFolders: $expandedFolders,
-                            renamingNodeID: $renamingNodeID,
-                            renameDraft: $renameDraft,
-                            confirmDelete: $confirmDelete,
-                            forceExpanded: isSearching
-                        )
-                    }
-                }
-            }
-            .listStyle(.sidebar)
-            .font(.system(size: 12, design: .monospaced))
-            .environment(\.defaultMinListRowHeight, 20)
-            .searchable(text: $store.searchText, placement: .sidebar, prompt: "Search files")
-            .contextMenu {
-                creationMenu(folderPath: nil)
-            }
+            Divider()
+
+            sectionPicker
+
+            sectionContent
 
             statusFooter
         }
@@ -66,70 +53,308 @@ struct SidebarView: View {
         }
         .onChange(of: store.searchText) { _, _ in
             if isSearching {
-                expandedFolders.formUnion(FileTreeNode.folderPaths(in: treeNodes))
+                withAnimation(sidebarAnimation) {
+                    expandedFolders.formUnion(FileTreeNode.folderPaths(in: treeNodes))
+                }
             }
         }
+    }
+
+    private var sectionContent: some View {
+        ZStack {
+            switch store.workspaceSection {
+            case .files:
+                fileList
+                    .transition(sectionTransition)
+            case .changes:
+                changesList
+                    .transition(sectionTransition)
+            case .references:
+                referenceList
+                    .transition(sectionTransition)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .animation(sidebarAnimation, value: store.workspaceSection)
     }
 
     private var selectionBinding: Binding<String?> {
         Binding {
             store.selectedFileID
         } set: { newValue in
-            store.selectFile(id: newValue)
+            store.previewFile(id: newValue)
         }
     }
 
-    private var sidebarHeader: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 9) {
-                BrandLogoView(size: 30)
+    private var referenceSelectionBinding: Binding<ReferenceItem.ID?> {
+        Binding {
+            store.selectedReferenceID
+        } set: { newValue in
+            store.selectReference(id: newValue)
+        }
+    }
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(AppBrand.displayName)
-                        .font(AppBrand.monoFont(size: 13, weight: .semibold))
-                        .lineLimit(1)
+    private var gitSelectionBinding: Binding<GitChangedFile.ID?> {
+        Binding {
+            store.selectedGitChangeID
+        } set: { newValue in
+            store.selectGitChange(id: newValue)
+        }
+    }
 
-                    Text("EXPLORER")
-                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .tracking(0.8)
+    private var sectionPicker: some View {
+        Picker("Library Section", selection: workspaceSectionBinding) {
+            ForEach(WorkspaceSection.allCases) { section in
+                Label(section.title, systemImage: section.systemImage)
+                    .tag(section)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    private var workspaceSectionBinding: Binding<WorkspaceSection> {
+        Binding {
+            store.workspaceSection
+        } set: { newValue in
+            withAnimation(sidebarAnimation) {
+                store.setWorkspaceSection(newValue)
+            }
+        }
+    }
+
+    private var fileList: some View {
+        List(selection: selectionBinding) {
+            if treeNodes.isEmpty {
+                emptyTreeRow
+            } else {
+                ForEach(treeNodes) { node in
+                    FileTreeRow(
+                        node: node,
+                        expandedFolders: $expandedFolders,
+                        renamingNodeID: $renamingNodeID,
+                        renameDraft: $renameDraft,
+                        confirmDelete: $confirmDelete,
+                        forceExpanded: isSearching
+                    )
                 }
+            }
+        }
+        .listStyle(.sidebar)
+        .font(.system(size: 12))
+        .environment(\.defaultMinListRowHeight, FileTreeMetrics.rowHeight)
+        .searchable(text: $store.searchText, placement: .sidebar, prompt: "Search files")
+        .contextMenu {
+            creationMenu(folderPath: nil)
+        }
+        .background(isRootFileDropTargeted ? Color.accentColor.opacity(0.08) : Color.clear, in: Rectangle())
+        .overlay {
+            FileDropTargetOverlay(isTargeted: isRootFileDropTargeted)
+        }
+        .animation(sidebarAnimation, value: isRootFileDropTargeted)
+        .animation(sidebarAnimation, value: expandedFolders)
+        .animation(sidebarAnimation, value: treeNodes.map(\.id))
+        .onDrop(of: [UTType.fileURL], isTargeted: $isRootFileDropTargeted) { providers in
+            handleFileDrop(providers, into: nil)
+        }
+    }
 
-                Spacer()
-
-                GlassEffectContainer(spacing: 6) {
-                    HStack(spacing: 6) {
-                        headerButton("New File", systemImage: "doc.badge.plus") {
-                            store.createFile(format: .markdown, in: nil)
+    private var referenceList: some View {
+        List(selection: referenceSelectionBinding) {
+            if store.filteredReferences.isEmpty {
+                ReferenceEmptyRow()
+            } else {
+                ForEach(store.filteredReferences) { reference in
+                    ReferenceSidebarRow(
+                        reference: reference,
+                        isDuplicate: store.isDuplicateReferenceKey(reference.citationKey),
+                        pdfExists: store.referencePDFExists(reference)
+                    )
+                    .sidebarRowMotion()
+                    .tag(reference.id)
+                    .contextMenu {
+                        Button {
+                            store.selectReference(id: reference.id)
+                            store.insertSelectedCitation()
+                        } label: {
+                            Label("Insert Citation", systemImage: "text.badge.plus")
                         }
-                        headerButton("New Folder", systemImage: "folder.badge.plus") {
-                            store.createFolder(in: nil)
+                        Button {
+                            store.selectReference(id: reference.id)
+                            store.copySelectedBibTeXToClipboard()
+                        } label: {
+                            Label("Copy BibTeX", systemImage: "doc.on.doc")
                         }
-                        headerButton("Open Vault", systemImage: "folder") {
-                            store.chooseVault()
+                        Divider()
+                        Button {
+                            store.selectReference(id: reference.id)
+                            store.attachPDFToSelectedReferenceRequested()
+                        } label: {
+                            Label("Attach PDF", systemImage: "paperclip")
                         }
                     }
                 }
             }
+        }
+        .listStyle(.sidebar)
+        .font(.system(size: 13))
+        .environment(\.defaultMinListRowHeight, 34)
+        .searchable(text: $store.referenceSearchText, placement: .sidebar, prompt: "Search references")
+        .contextMenu {
+            Button {
+                store.importBibTeXFileRequested()
+            } label: {
+                Label("Import .bib", systemImage: "square.and.arrow.down")
+            }
+            Button {
+                store.pasteBibTeXRequested()
+            } label: {
+                Label("Paste BibTeX", systemImage: "doc.on.clipboard")
+            }
+            Divider()
+            Button {
+                store.exportAllReferencesRequested()
+            } label: {
+                Label("Export All", systemImage: "square.and.arrow.up")
+            }
+            .disabled(store.references.isEmpty)
+        }
+        .animation(sidebarAnimation, value: store.filteredReferences.map(\.id))
+    }
 
-            HStack(spacing: 6) {
-                Image(systemName: "folder")
-                    .foregroundStyle(.secondary)
-                    .frame(width: 14)
+    private var changesList: some View {
+        List(selection: gitSelectionBinding) {
+            if !store.gitSnapshot.isRepository {
+                GitSidebarEmptyRow(
+                    title: "No Repository",
+                    message: "Initialize git to inspect file changes.",
+                    systemImage: "nosign"
+                )
+            } else if store.gitChanges.isEmpty {
+                GitSidebarEmptyRow(
+                    title: "Working Tree Clean",
+                    message: "No changed files.",
+                    systemImage: "checkmark.circle"
+                )
+            } else {
+                Section("Changed Files") {
+                    ForEach(store.gitChanges) { change in
+                        GitSidebarChangeRow(change: change)
+                            .tag(change.id)
+                            .contextMenu {
+                                Button {
+                                    store.selectGitChange(id: change.id)
+                                    store.stageSelectedGitChange()
+                                } label: {
+                                    Label("Stage File", systemImage: "plus.circle")
+                                }
+                                .disabled(!change.canStage)
 
-                Text(store.vaultURL?.lastPathComponent ?? "No Vault")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .lineLimit(1)
+                                Button {
+                                    store.selectGitChange(id: change.id)
+                                    store.unstageSelectedGitChange()
+                                } label: {
+                                    Label("Unstage File", systemImage: "minus.circle")
+                                }
+                                .disabled(!change.canUnstage)
 
-                Spacer(minLength: 8)
-
-                Text("\(store.files.count)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                                if store.files.contains(where: { $0.id == change.path }) {
+                                    Divider()
+                                    Button {
+                                        store.openFile(change.path)
+                                    } label: {
+                                        Label("Open File", systemImage: "doc.text")
+                                    }
+                                }
+                            }
+                    }
+                }
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .listStyle(.sidebar)
+        .font(.system(size: 12))
+        .environment(\.defaultMinListRowHeight, 42)
+        .animation(sidebarAnimation, value: store.gitChanges.map(\.id))
+    }
+
+    private var sidebarHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                BrandLogoView(size: 24)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(sidebarTitle)
+                        .font(.headline.weight(.semibold))
+                        .lineLimit(1)
+
+                    Text(sidebarSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                HStack(spacing: 4) {
+                    headerButton("Hide Sidebar", systemImage: "sidebar.left") {
+                        withAnimation(sidebarAnimation) {
+                            sidebarVisible = false
+                        }
+                    }
+
+                    Menu {
+                        Button {
+                            store.createNote()
+                        } label: {
+                            Label("New Note", systemImage: "square.and.pencil")
+                        }
+                        .disabled(store.vaultURL == nil)
+
+                        Menu("New File") {
+                            ForEach(NewFileFormat.allCases) { format in
+                                Button {
+                                    store.createFile(format: format, in: nil)
+                                } label: {
+                                    Label(format.title, systemImage: format.systemImage)
+                                }
+                            }
+                        }
+                        .disabled(store.vaultURL == nil)
+
+                        Button {
+                            store.createFolder(in: nil)
+                        } label: {
+                            Label("New Folder", systemImage: "folder.badge.plus")
+                        }
+                        .disabled(store.vaultURL == nil)
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .menuStyle(.button)
+                    .fixedSize()
+                    .help("Create")
+                    .accessibilityLabel("Create")
+
+                    headerButton("Open Vault", systemImage: "folder") {
+                        store.chooseVault()
+                    }
+                }
+            }
+
+            HStack(spacing: 12) {
+                Label(fileCountText, systemImage: "doc.text")
+                Label(gitSummaryText, systemImage: store.gitSnapshot.isRepository ? "point.3.connected.trianglepath.dotted" : "nosign")
+                    .lineLimit(1)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
         .contextMenu {
             creationMenu(folderPath: nil)
             Divider()
@@ -160,9 +385,47 @@ struct SidebarView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            Spacer(minLength: 8)
+
+            Button {
+                refreshRotation += 360
+                store.reloadFiles()
+                store.refreshGitStatus()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 16, height: 16)
+                    .rotationEffect(.degrees(refreshRotation))
+            }
+            .buttonStyle(.borderless)
+            .disabled(store.vaultURL == nil)
+            .help("Refresh")
+            .accessibilityLabel("Refresh")
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.vertical, 7)
+        .background(.regularMaterial, in: Rectangle())
+        .animation(sidebarAnimation, value: refreshRotation)
+    }
+
+    private var sidebarTitle: String {
+        store.vaultURL?.lastPathComponent ?? AppBrand.displayName
+    }
+
+    private var sidebarSubtitle: String {
+        store.vaultURL == nil ? "No vault open" : "Vault"
+    }
+
+    private var fileCountText: String {
+        let count = store.files.count
+        return count == 1 ? "1 file" : "\(count) files"
+    }
+
+    private var gitSummaryText: String {
+        if store.gitSnapshot.isRepository {
+            return store.gitSnapshot.summary
+        }
+        return store.vaultURL == nil ? "No vault" : "No git"
     }
 
     private func headerButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
@@ -170,7 +433,7 @@ struct SidebarView: View {
             Image(systemName: systemImage)
                 .frame(width: 16, height: 16)
         }
-        .buttonStyle(.glass)
+        .buttonStyle(.borderless)
         .help(title)
         .accessibilityLabel(title)
         .disabled(store.vaultURL == nil && title != "Open Vault")
@@ -201,23 +464,177 @@ struct SidebarView: View {
 
     private func expand(_ folderPath: String?) {
         guard let folderPath, !folderPath.isEmpty else { return }
-        expandedFolders.insert(folderPath)
+        withAnimation(sidebarAnimation) {
+            expandedFolders.insert(folderPath)
+        }
     }
 
     private func expandAncestors(of fileID: String?) {
         guard let fileID else { return }
-        expandedFolders.formUnion(FileTreeNode.ancestorFolderPaths(for: fileID))
+        withAnimation(sidebarAnimation) {
+            expandedFolders.formUnion(FileTreeNode.ancestorFolderPaths(for: fileID))
+        }
+    }
+
+    private func handleFileDrop(_ providers: [NSItemProvider], into folderPath: String?) -> Bool {
+        handleVaultFileDrop(providers, store: store, folderPath: folderPath) {
+            expand(folderPath)
+        }
+    }
+
+    private var sidebarAnimation: Animation? {
+        reduceMotion ? nil : .snappy(duration: 0.22)
+    }
+
+    private var sectionTransition: AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .move(edge: .trailing).combined(with: .opacity),
+            removal: .move(edge: .leading).combined(with: .opacity)
+        )
+    }
+}
+
+private struct ReferenceEmptyRow: View {
+    var body: some View {
+        Text("No references")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 4)
+    }
+}
+
+private struct GitSidebarEmptyRow: View {
+    let title: String
+    let message: String
+    let systemImage: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+            Text(message)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct GitSidebarChangeRow: View {
+    let change: GitChangedFile
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: change.systemImage)
+                .foregroundStyle(.secondary)
+                .font(.system(size: 11))
+                .frame(width: 14)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(change.displayName)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Text(change.parentPath)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 4)
+
+            GitSidebarStatusDot(change: change)
+        }
+        .frame(minHeight: 34)
+        .contentShape(Rectangle())
+        .help("\(change.displayStatus): \(change.path)")
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct GitSidebarStatusDot: View {
+    let change: GitChangedFile
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
+            .help(change.displayStatus)
+            .accessibilityLabel(change.displayStatus)
+    }
+
+    private var color: Color {
+        if change.isUntracked {
+            return .green
+        }
+        if change.hasStagedChanges, change.hasUnstagedChanges {
+            return .purple
+        }
+        if change.hasStagedChanges {
+            return .blue
+        }
+        return .orange
+    }
+}
+
+private struct ReferenceSidebarRow: View {
+    let reference: ReferenceItem
+    let isDuplicate: Bool
+    let pdfExists: Bool
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "book.closed")
+                .foregroundStyle(.secondary)
+                .font(.system(size: 11))
+                .frame(width: 14)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text(reference.citationKey)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    if isDuplicate {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                    }
+                    if reference.pdfRelativePath != nil {
+                        Image(systemName: pdfExists ? "paperclip" : "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(pdfExists ? Color.secondary : Color.orange)
+                    }
+                }
+
+                Text(reference.displayTitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: 32)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 }
 
 private struct FileTreeRow: View {
     @EnvironmentObject private var store: VaultStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let node: FileTreeNode
     @Binding var expandedFolders: Set<String>
     @Binding var renamingNodeID: String?
     @Binding var renameDraft: String
     @Binding var confirmDelete: Bool
     let forceExpanded: Bool
+    @State private var isDropTargeted = false
 
     var body: some View {
         if node.isFolder {
@@ -234,6 +651,10 @@ private struct FileTreeRow: View {
                 }
             } label: {
                 folderLabel
+                    .dropTargetHighlight(isTargeted: isDropTargeted)
+                    .onDrop(of: [UTType.fileURL], isTargeted: $isDropTargeted) { providers in
+                        handleFileDrop(providers, into: node.relativePath)
+                    }
                     .contextMenu {
                         folderContextMenu
                     }
@@ -241,14 +662,21 @@ private struct FileTreeRow: View {
             .contextMenu {
                 folderContextMenu
             }
-            .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
+            .listRowInsets(FileTreeMetrics.rowInsets)
+            .animation(rowAnimation, value: expansionBinding.wrappedValue)
+            .animation(rowAnimation, value: isDropTargeted)
         } else if let file = node.file {
             fileLabel(file)
+                .dropTargetHighlight(isTargeted: isDropTargeted)
+                .onDrop(of: [UTType.fileURL], isTargeted: $isDropTargeted) { providers in
+                    handleFileDrop(providers, into: FileTreeNode.parentFolderPath(for: file.relativePath))
+                }
                 .tag(file.id)
                 .contextMenu {
                     fileContextMenu(file)
                 }
-                .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
+                .listRowInsets(FileTreeMetrics.rowInsets)
+                .animation(rowAnimation, value: isDropTargeted)
         }
     }
 
@@ -262,7 +690,8 @@ private struct FileTreeRow: View {
                 onCancel: cancelRename
             )
         } else {
-            FolderTreeLabel(name: node.name)
+            FolderTreeLabel(name: node.name, isExpanded: expansionBinding.wrappedValue)
+                .sidebarRowMotion()
         }
     }
 
@@ -277,6 +706,13 @@ private struct FileTreeRow: View {
             )
         } else {
             FileTreeLabel(file: file)
+                .sidebarRowMotion()
+                .simultaneousGesture(TapGesture().onEnded {
+                    store.previewFile(id: file.id)
+                })
+                .simultaneousGesture(TapGesture(count: 2).onEnded {
+                    store.openFile(file.id)
+                })
         }
     }
 
@@ -285,10 +721,12 @@ private struct FileTreeRow: View {
             forceExpanded || expandedFolders.contains(node.relativePath)
         } set: { isExpanded in
             guard !forceExpanded else { return }
-            if isExpanded {
-                expandedFolders.insert(node.relativePath)
-            } else {
-                expandedFolders.remove(node.relativePath)
+            withAnimation(rowAnimation) {
+                if isExpanded {
+                    expandedFolders.insert(node.relativePath)
+                } else {
+                    expandedFolders.remove(node.relativePath)
+                }
             }
         }
     }
@@ -362,16 +800,14 @@ private struct FileTreeRow: View {
         }
 
         Button("Reveal in Finder") {
-            store.selectFile(id: file.id)
-            store.revealSelectedInFinder()
+            NSWorkspace.shared.activateFileViewerSelecting([file.url])
         }
         Button("Open Externally") {
-            store.selectFile(id: file.id)
-            store.openSelectedExternally()
+            NSWorkspace.shared.open(file.url)
         }
         Divider()
         Button("Move to Trash", role: .destructive) {
-            store.selectFile(id: file.id)
+            store.openFile(file.id)
             confirmDelete = true
         }
     }
@@ -402,6 +838,16 @@ private struct FileTreeRow: View {
         }
     }
 
+    private func handleFileDrop(_ providers: [NSItemProvider], into folderPath: String?) -> Bool {
+        handleVaultFileDrop(providers, store: store, folderPath: folderPath) {
+            if let folderPath {
+                withAnimation(rowAnimation) {
+                    expandedFolders.insert(folderPath)
+                }
+            }
+        }
+    }
+
     private func replaceExpandedFolderPaths(oldPrefix: String, newPrefix: String) {
         expandedFolders = Set(expandedFolders.map { path in
             if path == oldPrefix {
@@ -413,25 +859,45 @@ private struct FileTreeRow: View {
             return path
         })
     }
+
+    private var rowAnimation: Animation? {
+        reduceMotion ? nil : .snappy(duration: 0.18)
+    }
+}
+
+private enum FileTreeMetrics {
+    static let rowHeight: CGFloat = 18
+    static let rowInsets = EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6)
+    static let rowSpacing: CGFloat = 5
+    static let iconSize: CGFloat = 10.5
+    static let iconWidth: CGFloat = 13
 }
 
 private struct FolderTreeLabel: View {
     let name: String
+    let isExpanded: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "folder")
-                .foregroundStyle(.secondary)
-                .font(.system(size: 11))
-                .frame(width: 14)
+        HStack(spacing: FileTreeMetrics.rowSpacing) {
+            Image(systemName: isExpanded ? "folder.fill" : "folder")
+                .foregroundStyle(isExpanded ? Color.accentColor : Color.secondary)
+                .font(.system(size: FileTreeMetrics.iconSize))
+                .frame(width: FileTreeMetrics.iconWidth)
+                .scaleEffect(isExpanded && !reduceMotion ? 1.06 : 1)
             Text(name)
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
         }
-        .frame(minHeight: 20)
+        .frame(maxWidth: .infinity, minHeight: FileTreeMetrics.rowHeight, alignment: .leading)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
+        .animation(labelAnimation, value: isExpanded)
+    }
+
+    private var labelAnimation: Animation? {
+        reduceMotion ? nil : .snappy(duration: 0.18)
     }
 }
 
@@ -444,18 +910,18 @@ private struct EditableTreeLabel: View {
     @State private var canCommitOnFocusLoss = false
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: FileTreeMetrics.rowSpacing) {
             Image(systemName: systemImage)
                 .foregroundStyle(.secondary)
-                .font(.system(size: 11))
-                .frame(width: 14)
+                .font(.system(size: FileTreeMetrics.iconSize))
+                .frame(width: FileTreeMetrics.iconWidth)
 
             TextField("Name", text: $text)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .lineLimit(1)
                 .padding(.horizontal, 3)
-                .padding(.vertical, 1)
+                .padding(.vertical, 0)
                 .background(
                     RoundedRectangle(cornerRadius: 3)
                         .fill(Color(nsColor: .textBackgroundColor))
@@ -470,7 +936,7 @@ private struct EditableTreeLabel: View {
 
             Spacer(minLength: 0)
         }
-        .frame(minHeight: 20)
+        .frame(maxWidth: .infinity, minHeight: FileTreeMetrics.rowHeight, alignment: .leading)
         .contentShape(Rectangle())
         .onAppear {
             DispatchQueue.main.async {
@@ -491,20 +957,167 @@ private struct FileTreeLabel: View {
     let file: VaultFile
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: FileTreeMetrics.rowSpacing) {
             Image(systemName: file.kind.systemImage)
                 .foregroundStyle(.secondary)
-                .font(.system(size: 11))
-                .frame(width: 14)
+                .font(.system(size: FileTreeMetrics.iconSize))
+                .frame(width: FileTreeMetrics.iconWidth)
             Text(file.name)
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
         }
-        .frame(minHeight: 20)
+        .frame(maxWidth: .infinity, minHeight: FileTreeMetrics.rowHeight, alignment: .leading)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
+}
+
+private struct FileDropTargetOverlay: View {
+    let isTargeted: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if isTargeted {
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(
+                    Color.accentColor.opacity(0.65),
+                    style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                )
+                .padding(4)
+                .allowsHitTesting(false)
+                .transition(reduceMotion ? .opacity : .scale(scale: 0.985).combined(with: .opacity))
+        }
+    }
+}
+
+private struct DropTargetHighlightModifier: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let isTargeted: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isTargeted ? Color.accentColor.opacity(0.14) : Color.clear)
+            )
+            .scaleEffect(isTargeted && !reduceMotion ? 1.012 : 1, anchor: .leading)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.16), value: isTargeted)
+    }
+}
+
+private struct SidebarRowMotionModifier: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .offset(x: isHovered && !reduceMotion ? 1.5 : 0)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.16), value: isHovered)
+            .onHover { hovering in
+                isHovered = hovering
+            }
+    }
+}
+
+private extension View {
+    func dropTargetHighlight(isTargeted: Bool) -> some View {
+        modifier(DropTargetHighlightModifier(isTargeted: isTargeted))
+    }
+
+    func sidebarRowMotion() -> some View {
+        modifier(SidebarRowMotionModifier())
+    }
+}
+
+@MainActor
+private func handleVaultFileDrop(
+    _ providers: [NSItemProvider],
+    store: VaultStore,
+    folderPath: String?,
+    onAccepted: () -> Void
+) -> Bool {
+    guard store.vaultURL != nil else {
+        store.statusMessage = "Choose a vault before dropping files."
+        return false
+    }
+
+    let fileProviders = providers.filter {
+        $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+    }
+    guard !fileProviders.isEmpty else { return false }
+
+    onAccepted()
+    loadDroppedFileURLs(from: fileProviders) { urls in
+        guard !urls.isEmpty else { return }
+        store.importFiles(urls, into: folderPath)
+    }
+    return true
+}
+
+private final class DroppedFileURLAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urlsByProvider: [URL?]
+
+    init(count: Int) {
+        urlsByProvider = Array(repeating: nil, count: count)
+    }
+
+    func set(_ url: URL, at index: Int) {
+        lock.lock()
+        urlsByProvider[index] = url
+        lock.unlock()
+    }
+
+    func compactURLs() -> [URL] {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return urlsByProvider.compactMap(\.self)
+    }
+}
+
+private func loadDroppedFileURLs(from providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
+    let group = DispatchGroup()
+    let accumulator = DroppedFileURLAccumulator(count: providers.count)
+
+    for (index, provider) in providers.enumerated() {
+        group.enter()
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            if let url = droppedFileURL(from: item) {
+                accumulator.set(url, at: index)
+            }
+            group.leave()
+        }
+    }
+
+    group.notify(queue: .main) {
+        completion(accumulator.compactURLs())
+    }
+}
+
+private func droppedFileURL(from item: NSSecureCoding?) -> URL? {
+    if let url = item as? URL {
+        return url.isFileURL ? url : nil
+    }
+    if let data = item as? Data,
+       let string = String(data: data, encoding: .utf8) {
+        return fileURL(fromDropString: string)
+    }
+    if let string = item as? String {
+        return fileURL(fromDropString: string)
+    }
+    return nil
+}
+
+private func fileURL(fromDropString string: String) -> URL? {
+    let string = string.trimmed
+    if let url = URL(string: string), url.isFileURL {
+        return url
+    }
+    guard string.hasPrefix("/") else { return nil }
+    return URL(fileURLWithPath: string)
 }
 
 private struct FileTreeNode: Identifiable, Hashable {

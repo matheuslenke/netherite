@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-enum SyntaxLanguage {
+enum SyntaxLanguage: Sendable {
     case markdown
     case latex
     case none
@@ -16,30 +16,64 @@ enum SyntaxLanguage {
             self = .none
         }
     }
+
+    var lineCommentStyle: EditorLineCommentStyle {
+        switch self {
+        case .markdown:
+            .wrapping(open: "<!--", close: "-->")
+        case .latex:
+            .prefix("% ")
+        case .none:
+            .prefix("// ")
+        }
+    }
 }
 
 struct SyntaxHighlightingEditor: NSViewRepresentable {
     @Binding var text: String
     let language: SyntaxLanguage
     let isEditable: Bool
+    var scrollSync: Binding<ScrollSyncState>?
+    var scrollTargetOffset: Binding<Int?>?
+    let scrollSyncSource: ScrollSyncSource
+
+    init(
+        text: Binding<String>,
+        language: SyntaxLanguage,
+        isEditable: Bool,
+        scrollSync: Binding<ScrollSyncState>? = nil,
+        scrollTargetOffset: Binding<Int?>? = nil,
+        scrollSyncSource: ScrollSyncSource = .editor
+    ) {
+        self._text = text
+        self.language = language
+        self.isEditable = isEditable
+        self.scrollSync = scrollSync
+        self.scrollTargetOffset = scrollTargetOffset
+        self.scrollSyncSource = scrollSyncSource
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
+        let scrollView = Self.makeEditorScrollView()
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
+        context.coordinator.configureScrollObservation(for: scrollView)
 
         guard let textView = scrollView.documentView as? NSTextView else {
             return scrollView
         }
 
         textView.delegate = context.coordinator
+        if let textView = textView as? ShortcutTextView {
+            textView.commentStyle = language.lineCommentStyle
+        }
         textView.drawsBackground = false
         textView.isRichText = false
         textView.importsGraphics = false
@@ -65,43 +99,234 @@ struct SyntaxHighlightingEditor: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.configureScrollObservation(for: scrollView)
         guard let textView = scrollView.documentView as? NSTextView else { return }
 
         textView.isEditable = isEditable
         textView.isSelectable = true
+        if let textView = textView as? ShortcutTextView {
+            textView.commentStyle = language.lineCommentStyle
+        }
 
         if textView.string != text {
             context.coordinator.applyText(text, language: language)
         } else if context.coordinator.appliedLanguage != language ||
                   context.coordinator.appliedAppearanceName != textView.effectiveAppearance.name {
-            context.coordinator.highlight(language: language)
+            context.coordinator.highlight(language: language, force: true)
         }
+
+        context.coordinator.applyRemoteScrollIfNeeded(in: scrollView)
+        context.coordinator.applyScrollTargetIfNeeded(in: scrollView)
     }
 
     static var baseFont: NSFont { .monospacedSystemFont(ofSize: 14, weight: .regular) }
 
+    private static func makeEditorScrollView() -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+
+        let contentSize = scrollView.contentSize
+        let textStorage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+
+        let textContainer = NSTextContainer(
+            containerSize: NSSize(width: contentSize.width, height: .greatestFiniteMagnitude)
+        )
+        textContainer.widthTracksTextView = true
+        layoutManager.addTextContainer(textContainer)
+
+        let textView = ShortcutTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: textContainer)
+        textView.minSize = NSSize(width: 0, height: contentSize.height)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+
+        scrollView.documentView = textView
+        return scrollView
+    }
+
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
+        private static let liveHighlightDelayNanoseconds: UInt64 = 120_000_000
+        private static let maximumHighlightedLength = 220_000
+
         var parent: SyntaxHighlightingEditor
         weak var textView: NSTextView?
+        private weak var scrollView: NSScrollView?
+        private weak var observedClipView: NSClipView?
         var appliedLanguage: SyntaxLanguage = .none
         var appliedAppearanceName: NSAppearance.Name?
+        private var highlightTask: Task<Void, Never>?
+        private var appliedScrollRevision: Int?
+        private var isApplyingScrollSync = false
 
         init(_ parent: SyntaxHighlightingEditor) {
             self.parent = parent
         }
 
-        func applyText(_ newText: String, language: SyntaxLanguage) {
-            guard let textView else { return }
-            let selectedRanges = textView.selectedRanges
-            textView.string = newText
-            highlight(language: language)
-            textView.selectedRanges = selectedRanges
+        deinit {
+            highlightTask?.cancel()
+            NotificationCenter.default.removeObserver(self)
         }
 
-        func highlight(language: SyntaxLanguage) {
+        func configureScrollObservation(for scrollView: NSScrollView) {
+            self.scrollView = scrollView
+
+            guard observedClipView !== scrollView.contentView else { return }
+
+            if let observedClipView {
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: NSView.boundsDidChangeNotification,
+                    object: observedClipView
+                )
+            }
+
+            observedClipView = scrollView.contentView
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(scrollViewDidScroll(_:)),
+                name: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView
+            )
+        }
+
+        @objc private func scrollViewDidScroll(_ notification: Notification) {
+            guard let scrollView else { return }
+            publishScrollProgress(from: scrollView)
+        }
+
+        func applyRemoteScrollIfNeeded(in scrollView: NSScrollView) {
+            guard let state = parent.scrollSync?.wrappedValue,
+                  appliedScrollRevision != state.revision
+            else {
+                return
+            }
+
+            scrollView.layoutSubtreeIfNeeded()
+
+            let metrics = scrollMetrics(for: scrollView)
+            guard metrics.maxOffset > 0 || state.progress == 0 else { return }
+
+            let targetOffset = state.progress * metrics.maxOffset
+            appliedScrollRevision = state.revision
+            guard abs(metrics.offset - targetOffset) > SynchronizedScrolling.offsetTolerance else { return }
+
+            isApplyingScrollSync = true
+            scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetOffset))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            isApplyingScrollSync = false
+        }
+
+        func applyScrollTargetIfNeeded(in scrollView: NSScrollView) {
+            guard let targetOffset = parent.scrollTargetOffset?.wrappedValue,
+                  let textView
+            else {
+                return
+            }
+
+            let clampedOffset = min(max(targetOffset, 0), (textView.string as NSString).length)
+            let range = NSRange(location: clampedOffset, length: 0)
+            textView.setSelectedRange(range)
+            textView.scrollRangeToVisible(range)
+
+            if parent.scrollTargetOffset?.wrappedValue == targetOffset {
+                parent.scrollTargetOffset?.wrappedValue = nil
+            }
+
+            publishScrollProgress(from: scrollView)
+        }
+
+        private func publishScrollProgress(from scrollView: NSScrollView) {
+            guard !isApplyingScrollSync,
+                  let scrollSync = parent.scrollSync
+            else {
+                return
+            }
+
+            let metrics = scrollMetrics(for: scrollView)
+            let currentState = scrollSync.wrappedValue
+            guard abs(currentState.progress - metrics.progress) > SynchronizedScrolling.progressTolerance else { return }
+
+            let source = parent.scrollSyncSource
+            let progress = metrics.progress
+            Task { @MainActor [weak self] in
+                guard let self,
+                      !self.isApplyingScrollSync,
+                      let scrollSync = self.parent.scrollSync
+                else {
+                    return
+                }
+
+                let currentState = scrollSync.wrappedValue
+                guard abs(currentState.progress - progress) > SynchronizedScrolling.progressTolerance else { return }
+
+                scrollSync.wrappedValue = SynchronizedScrolling.nextState(
+                    from: currentState,
+                    source: source,
+                    progress: progress
+                )
+            }
+        }
+
+        private func scrollMetrics(for scrollView: NSScrollView) -> ScrollSyncMetrics {
+            let contentLength = scrollView.documentView?.bounds.height ?? scrollView.contentSize.height
+            return SynchronizedScrolling.metrics(
+                offset: scrollView.contentView.bounds.origin.y,
+                contentLength: contentLength,
+                viewportLength: scrollView.contentView.bounds.height
+            )
+        }
+
+        func applyText(_ newText: String, language: SyntaxLanguage) {
+            guard let textView else { return }
+            highlightTask?.cancel()
+            let selectedRanges = textView.selectedRanges
+            applyBaseTextStyle(to: textView)
+            textView.string = newText
+            textView.selectedRanges = clampedSelectedRanges(selectedRanges, length: (newText as NSString).length)
+            appliedLanguage = language
+            appliedAppearanceName = textView.effectiveAppearance.name
+
+            guard (newText as NSString).length <= Self.maximumHighlightedLength else { return }
+            scheduleHighlight(language: language, delayNanoseconds: 1)
+        }
+
+        private func applyBaseTextStyle(to textView: NSTextView) {
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: SyntaxHighlightingEditor.baseFont,
+                .foregroundColor: NSColor.labelColor
+            ]
+            textView.font = SyntaxHighlightingEditor.baseFont
+            textView.textColor = .labelColor
+            textView.typingAttributes = attributes
+        }
+
+        private func clampedSelectedRanges(_ ranges: [NSValue], length: Int) -> [NSValue] {
+            let clampedRanges = ranges.compactMap { value -> NSValue? in
+                let range = value.rangeValue
+                guard range.location <= length else { return nil }
+                return NSValue(range: NSRange(location: range.location, length: min(range.length, length - range.location)))
+            }
+
+            return clampedRanges.isEmpty ? [NSValue(range: NSRange(location: length, length: 0))] : clampedRanges
+        }
+
+        func highlight(language: SyntaxLanguage, force: Bool = false) {
             guard let textView, let textStorage = textView.textStorage else { return }
             let appearance = textView.effectiveAppearance
+            guard force ||
+                textStorage.length <= Self.maximumHighlightedLength ||
+                appliedLanguage != language ||
+                appliedAppearanceName != appearance.name
+            else {
+                return
+            }
+
             let palette = SyntaxPalette(appearance: appearance)
             let fullRange = NSRange(location: 0, length: textStorage.length)
 
@@ -114,13 +339,15 @@ struct SyntaxHighlightingEditor: NSViewRepresentable {
                 range: fullRange
             )
 
-            switch language {
-            case .markdown:
-                SyntaxHighlighter.highlightMarkdown(in: textStorage, palette: palette)
-            case .latex:
-                SyntaxHighlighter.highlightLatex(in: textStorage, palette: palette)
-            case .none:
-                break
+            if textStorage.length <= Self.maximumHighlightedLength {
+                switch language {
+                case .markdown:
+                    SyntaxHighlighter.highlightMarkdown(in: textStorage, palette: palette)
+                case .latex:
+                    SyntaxHighlighter.highlightLatex(in: textStorage, palette: palette)
+                case .none:
+                    break
+                }
             }
 
             textStorage.endEditing()
@@ -131,8 +358,160 @@ struct SyntaxHighlightingEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
-            highlight(language: parent.language)
+            scheduleHighlight(language: parent.language)
         }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            TextInsertionService.registerFocusedTextView(textView)
+        }
+
+        private func scheduleHighlight(language: SyntaxLanguage) {
+            scheduleHighlight(language: language, delayNanoseconds: Self.liveHighlightDelayNanoseconds)
+        }
+
+        private func scheduleHighlight(language: SyntaxLanguage, delayNanoseconds: UInt64) {
+            highlightTask?.cancel()
+            highlightTask = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                } catch {
+                    return
+                }
+
+                guard let self, !Task.isCancelled else { return }
+                self.highlight(language: language)
+            }
+        }
+    }
+}
+
+private final class ShortcutTextView: NSTextView {
+    private enum KeyCode {
+        static let returnKey: UInt16 = 36
+        static let upArrow: UInt16 = 126
+        static let downArrow: UInt16 = 125
+    }
+
+    var commentStyle: EditorLineCommentStyle = .prefix("// ")
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if handleEditorShortcut(event) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if handleEditorShortcut(event) {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func insertTab(_ sender: Any?) {
+        guard isEditable else {
+            super.insertTab(sender)
+            return
+        }
+
+        if selectedRange().length == 0 {
+            insertText(EditorTextShortcutEngine.indentation, replacementRange: selectedRange())
+            return
+        }
+        applyEditorShortcut(.indentLines)
+    }
+
+    override func insertBacktab(_ sender: Any?) {
+        guard isEditable else {
+            super.insertBacktab(sender)
+            return
+        }
+
+        applyEditorShortcut(.outdentLines)
+    }
+
+    private func handleEditorShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .shift, .control])
+        let characters = event.charactersIgnoringModifiers?.lowercased()
+
+        if modifiers == [.command], characters == "f" {
+            NotificationCenter.default.post(name: .findRequested, object: nil)
+            return true
+        }
+
+        guard isEditable else { return false }
+
+        if modifiers == [.command], characters == "/" {
+            applyEditorShortcut(.toggleLineComment)
+            return true
+        }
+
+        if modifiers == [.command], characters == "[" {
+            applyEditorShortcut(.outdentLines)
+            return true
+        }
+
+        if modifiers == [.command], characters == "]" {
+            applyEditorShortcut(.indentLines)
+            return true
+        }
+
+        if modifiers == [.command, .shift], characters == "k" {
+            applyEditorShortcut(.deleteLines)
+            return true
+        }
+
+        if event.keyCode == KeyCode.returnKey, modifiers == [.command] {
+            applyEditorShortcut(.insertLineBelow)
+            return true
+        }
+
+        if event.keyCode == KeyCode.returnKey, modifiers == [.command, .shift] {
+            applyEditorShortcut(.insertLineAbove)
+            return true
+        }
+
+        if event.keyCode == KeyCode.upArrow, modifiers == [.option] {
+            applyEditorShortcut(.moveLinesUp)
+            return true
+        }
+
+        if event.keyCode == KeyCode.downArrow, modifiers == [.option] {
+            applyEditorShortcut(.moveLinesDown)
+            return true
+        }
+
+        if event.keyCode == KeyCode.upArrow, modifiers == [.option, .shift] {
+            applyEditorShortcut(.duplicateLinesUp)
+            return true
+        }
+
+        if event.keyCode == KeyCode.downArrow, modifiers == [.option, .shift] {
+            applyEditorShortcut(.duplicateLinesDown)
+            return true
+        }
+
+        return false
+    }
+
+    private func applyEditorShortcut(_ action: EditorTextShortcutAction) {
+        guard let textStorage,
+              let edit = EditorTextShortcutEngine.edit(
+                for: action,
+                in: string,
+                selectedRange: selectedRange(),
+                commentStyle: commentStyle
+              ),
+              shouldChangeText(in: edit.replacementRange, replacementString: edit.replacementText)
+        else {
+            return
+        }
+
+        textStorage.replaceCharacters(in: edit.replacementRange, with: edit.replacementText)
+        didChangeText()
+        setSelectedRange(edit.selectedRange)
+        scrollRangeToVisible(edit.selectedRange)
     }
 }
 

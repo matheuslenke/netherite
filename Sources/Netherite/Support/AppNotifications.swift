@@ -11,4 +11,5 @@ extension Notification.Name {
     static let gitPushRequested = Notification.Name("Netherite.gitPushRequested")
     static let importZipRequested = Notification.Name("Netherite.importZipRequested")
     static let deleteSelectedFileRequested = Notification.Name("Netherite.deleteSelectedFileRequested")
+    static let findRequested = Notification.Name("Netherite.findRequested")
 }

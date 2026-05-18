@@ -1,11 +1,12 @@
 import Foundation
 
-enum FileKind: String, Codable {
+enum FileKind: String, Codable, Sendable {
     case markdown
     case latex
     case text
     case code
     case data
+    case spreadsheet
     case richText
     case document
     case image
@@ -23,6 +24,8 @@ enum FileKind: String, Codable {
             self = .code
         case "csv", "tsv":
             self = .data
+        case "xlsx", "xlxs", "xlsm", "xltx", "xltm", "xls":
+            self = .spreadsheet
         case "rtf", "rtfd":
             self = .richText
         case "doc", "docx", "odt", "pages", "pdf":
@@ -46,6 +49,8 @@ enum FileKind: String, Codable {
             "chevron.left.forwardslash.chevron.right"
         case .data:
             "tablecells"
+        case .spreadsheet:
+            "tablecells"
         case .richText:
             "doc.append"
         case .document:
@@ -56,9 +61,18 @@ enum FileKind: String, Codable {
             "doc.badge.gearshape"
         }
     }
+
+    var canContainBacklinks: Bool {
+        switch self {
+        case .markdown, .latex, .text, .code, .data:
+            true
+        case .spreadsheet, .richText, .document, .image, .binary:
+            false
+        }
+    }
 }
 
-enum NewFileFormat: String, CaseIterable, Identifiable {
+enum NewFileFormat: String, CaseIterable, Identifiable, Sendable {
     case markdown
     case latex
     case bibtex
@@ -152,7 +166,7 @@ enum NewFileFormat: String, CaseIterable, Identifiable {
     }
 }
 
-struct VaultFolder: Identifiable, Hashable {
+struct VaultFolder: Identifiable, Hashable, Sendable {
     let id: String
     let url: URL
     let relativePath: String
@@ -166,7 +180,7 @@ struct VaultFolder: Identifiable, Hashable {
     }
 }
 
-struct VaultFile: Identifiable, Hashable {
+struct VaultFile: Identifiable, Hashable, Sendable {
     let id: String
     let url: URL
     let relativePath: String
@@ -175,6 +189,19 @@ struct VaultFile: Identifiable, Hashable {
     let kind: FileKind
     let byteCount: Int
     let modifiedAt: Date
+
+    var isPDF: Bool {
+        fileExtension.lowercased() == "pdf"
+    }
+
+    var isSpreadsheet: Bool {
+        switch fileExtension.lowercased() {
+        case "xlsx", "xlxs", "xlsm", "xltx", "xltm", "xls":
+            true
+        default:
+            false
+        }
+    }
 
     var parentPath: String {
         let parts = relativePath.split(separator: "/")
@@ -187,16 +214,36 @@ struct VaultFile: Identifiable, Hashable {
     }
 }
 
-struct DocumentStats {
+struct DocumentStats: Equatable, Sendable {
     let words: Int
     let characters: Int
     let lines: Int
 
+    static let empty = DocumentStats(text: "")
+
     init(text: String) {
-        words = text
-            .split { $0.isWhitespace || $0.isNewline }
-            .count
-        characters = text.count
-        lines = max(1, text.components(separatedBy: .newlines).count)
+        var wordCount = 0
+        var characterCount = 0
+        var lineCount = 1
+        var isInsideWord = false
+
+        for character in text {
+            characterCount += 1
+
+            if character.isNewline {
+                lineCount += 1
+            }
+
+            if character.isWhitespace || character.isNewline {
+                isInsideWord = false
+            } else if !isInsideWord {
+                wordCount += 1
+                isInsideWord = true
+            }
+        }
+
+        words = wordCount
+        characters = characterCount
+        lines = max(1, lineCount)
     }
 }

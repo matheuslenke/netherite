@@ -19,8 +19,8 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
 
-            Picker("Default editor mode", selection: $store.editorMode) {
-                ForEach(EditorMode.allCases) { mode in
+            Picker("Default editor mode", selection: editorModeBinding) {
+                ForEach(store.availableEditorModes) { mode in
                     Text(mode.title).tag(mode)
                 }
             }
@@ -64,5 +64,13 @@ struct SettingsView: View {
 
     private var selectionAnimation: Animation? {
         reduceMotion ? nil : .easeInOut(duration: 0.22)
+    }
+
+    private var editorModeBinding: Binding<EditorMode> {
+        Binding {
+            store.editorMode
+        } set: { newValue in
+            store.setEditorMode(newValue)
+        }
     }
 }

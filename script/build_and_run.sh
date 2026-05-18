@@ -16,7 +16,7 @@ APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 LOGO_SOURCE="$ROOT_DIR/Sources/Netherite/Resources/NetheriteLogo.png"
-ICON_NAME="Netherite"
+ICON_NAME="NetheriteLogo"
 
 stage_icon() {
   [[ -f "$LOGO_SOURCE" ]] || return 0

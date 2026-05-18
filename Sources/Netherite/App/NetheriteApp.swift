@@ -16,7 +16,7 @@ struct NetheriteApp: App {
             ContentView()
                 .environmentObject(store)
                 .frame(minWidth: 660, minHeight: 480)
-                .preferredColorScheme(appTheme.preferredColorScheme)
+                .appTheme(appTheme)
         }
         .defaultSize(width: 1180, height: 760)
         .windowToolbarStyle(.unified)
@@ -27,7 +27,7 @@ struct NetheriteApp: App {
         Settings {
             SettingsView()
                 .environmentObject(store)
-                .preferredColorScheme(appTheme.preferredColorScheme)
+                .appTheme(appTheme)
         }
     }
 }
@@ -78,6 +78,14 @@ struct NetheriteCommands: Commands {
             .disabled(!store.isDirty || !store.documentIsEditable)
         }
 
+        CommandGroup(after: .pasteboard) {
+            Button("Find...") {
+                NotificationCenter.default.post(name: .findRequested, object: nil)
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+            .disabled(store.currentFile == nil)
+        }
+
         CommandGroup(after: .toolbar) {
             Button(sidebarVisible ? "Hide Sidebar" : "Show Sidebar") {
                 sidebarVisible.toggle()
@@ -92,19 +100,42 @@ struct NetheriteCommands: Commands {
 
         CommandMenu("Editor") {
             Button("Original") {
-                store.editorMode = .edit
+                store.setEditorMode(.edit)
             }
             .keyboardShortcut("1", modifiers: [.command])
+            .disabled(store.selectedFileIsPreviewOnly)
 
             Button("Preview") {
-                store.editorMode = .preview
+                store.setEditorMode(.preview)
             }
             .keyboardShortcut("2", modifiers: [.command])
 
             Button("Split") {
-                store.editorMode = .split
+                store.setEditorMode(.split)
             }
             .keyboardShortcut("3", modifiers: [.command])
+            .disabled(store.selectedFileIsPreviewOnly)
+
+            Divider()
+
+            Button("Keep Editor Open") {
+                if let fileID = store.selectedFileID {
+                    store.pinTab(fileID: fileID)
+                }
+            }
+            .keyboardShortcut("k", modifiers: [.command])
+            .disabled(store.selectedFileID == nil || store.previewTabFileID != store.selectedFileID)
+
+            Button("Close Editor") {
+                store.closeCurrentTab()
+            }
+            .keyboardShortcut("w", modifiers: [.command])
+            .disabled(store.selectedFileID == nil)
+
+            Button("Close All Editors") {
+                store.closeAllTabs()
+            }
+            .disabled(store.openFileTabIDs.isEmpty)
 
             Divider()
 
@@ -135,6 +166,53 @@ struct NetheriteCommands: Commands {
             .disabled(store.currentFile == nil)
         }
 
+        CommandMenu("References") {
+            Button("Show References") {
+                store.setWorkspaceSection(.references)
+            }
+            .keyboardShortcut("4", modifiers: [.command])
+            .disabled(store.vaultURL == nil)
+
+            Divider()
+
+            Button("Import BibTeX File…") {
+                store.importBibTeXFileRequested()
+            }
+            .keyboardShortcut("b", modifiers: [.command, .shift])
+            .disabled(store.vaultURL == nil)
+
+            Button("Paste BibTeX…") {
+                store.pasteBibTeXRequested()
+            }
+            .keyboardShortcut("b", modifiers: [.command, .option])
+            .disabled(store.vaultURL == nil)
+
+            Divider()
+
+            Button("Insert Citation…") {
+                store.insertCitationRequested()
+            }
+            .keyboardShortcut("k", modifiers: [.command, .shift])
+            .disabled(store.references.isEmpty)
+
+            Button("Attach PDF…") {
+                store.attachPDFToSelectedReferenceRequested()
+            }
+            .disabled(store.currentReference == nil)
+
+            Divider()
+
+            Button("Export All…") {
+                store.exportAllReferencesRequested()
+            }
+            .disabled(store.references.isEmpty)
+
+            Button("Export Selected…") {
+                store.exportSelectedReferencesRequested()
+            }
+            .disabled(store.currentReference == nil)
+        }
+
         CommandMenu("Vault") {
             Button("Refresh Files") {
                 store.reloadFiles()
@@ -148,6 +226,14 @@ struct NetheriteCommands: Commands {
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
             .disabled(!store.selectedFileCanRenderLatex || store.latexRenderState.isRendering)
+
+            Divider()
+
+            Button("Show Changes") {
+                store.showGitChanges()
+            }
+            .keyboardShortcut("d", modifiers: [.command, .option])
+            .disabled(!store.gitSnapshot.isRepository)
 
             Divider()
 

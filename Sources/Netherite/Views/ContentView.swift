@@ -10,11 +10,17 @@ struct ContentView: View {
     var body: some View {
         HSplitView {
             if sidebarVisible {
-                SidebarView(confirmDelete: $confirmDelete)
-                    .frame(minWidth: 190, idealWidth: 250, maxWidth: 360)
+                SidebarView(confirmDelete: $confirmDelete, sidebarVisible: $sidebarVisible)
+                    .frame(
+                        minWidth: SplitPaneMetrics.primarySidebarMinWidth,
+                        idealWidth: SplitPaneMetrics.primarySidebarIdealWidth,
+                        maxWidth: SplitPaneMetrics.primarySidebarMaxWidth
+                    )
+                    .transition(sidebarTransition)
             }
             WorkspaceView(confirmDelete: $confirmDelete)
-                .frame(minWidth: 360)
+                .frame(minWidth: SplitPaneMetrics.mainContentMinWidth, maxWidth: .infinity)
+                .layoutPriority(1)
         }
         .frame(minWidth: 660, minHeight: 480)
         .navigationTitle(windowTitle)
@@ -22,10 +28,13 @@ struct ContentView: View {
         .animation(layoutAnimation, value: sidebarVisible)
         .animation(layoutAnimation, value: store.inspectorVisible)
         .animation(layoutAnimation, value: store.editorMode)
+        .animation(layoutAnimation, value: store.openFileTabIDs)
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 Button {
-                    sidebarVisible.toggle()
+                    withAnimation(layoutAnimation) {
+                        sidebarVisible.toggle()
+                    }
                 } label: {
                     Label("Toggle Sidebar", systemImage: "sidebar.left")
                 }
@@ -50,6 +59,13 @@ struct ContentView: View {
                 } label: {
                     Label("Import .zip", systemImage: "doc.zipper")
                 }
+
+                Button {
+                    store.setWorkspaceSection(.references)
+                } label: {
+                    Label("References", systemImage: "books.vertical")
+                }
+                .disabled(store.vaultURL == nil)
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
@@ -67,26 +83,47 @@ struct ContentView: View {
                 }
                 .disabled(!store.selectedFileCanRenderLatex || store.latexRenderState.isRendering)
 
-                Button {
-                    store.pullVault()
-                } label: {
-                    Label("Pull", systemImage: "arrow.down.circle")
-                }
-                .disabled(!store.gitSnapshot.isRepository)
+                Menu {
+                    Button {
+                        store.refreshGitStatus()
+                    } label: {
+                        Label("Refresh Status", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(store.vaultURL == nil)
 
-                Button {
-                    store.commitVault()
-                } label: {
-                    Label("Commit", systemImage: "checkmark.circle")
-                }
-                .disabled(!store.gitSnapshot.isRepository)
+                    Button {
+                        store.showGitChanges()
+                    } label: {
+                        Label("Show Changes", systemImage: "point.3.connected.trianglepath.dotted")
+                    }
+                    .disabled(!store.gitSnapshot.isRepository)
 
-                Button {
-                    store.pushVault()
+                    Divider()
+
+                    Button {
+                        store.pullVault()
+                    } label: {
+                        Label("Pull", systemImage: "arrow.down.circle")
+                    }
+                    .disabled(!store.gitSnapshot.isRepository)
+
+                    Button {
+                        store.commitVault()
+                    } label: {
+                        Label("Commit All", systemImage: "checkmark.circle")
+                    }
+                    .disabled(!store.gitSnapshot.isRepository)
+
+                    Button {
+                        store.pushVault()
+                    } label: {
+                        Label("Push", systemImage: "arrow.up.circle")
+                    }
+                    .disabled(!store.gitSnapshot.isRepository)
                 } label: {
-                    Label("Push", systemImage: "arrow.up.circle")
+                    Label("Git", systemImage: "point.3.connected.trianglepath.dotted")
                 }
-                .disabled(!store.gitSnapshot.isRepository)
+                .help("Git Actions")
 
                 Button {
                     store.inspectorVisible.toggle()
@@ -105,6 +142,10 @@ struct ContentView: View {
             }
         } message: {
             Text(store.currentFile?.name ?? "Selected file")
+        }
+        .sheet(isPresented: $store.showingCitationPicker) {
+            CitationPickerView()
+                .environmentObject(store)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openVaultRequested)) { _ in
             store.chooseVault()
@@ -143,6 +184,11 @@ struct ContentView: View {
 
     private var layoutAnimation: Animation? {
         reduceMotion ? nil : .snappy(duration: 0.24)
+    }
+
+    private var sidebarTransition: AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .move(edge: .leading).combined(with: .opacity)
     }
 
     private var windowTitle: String {

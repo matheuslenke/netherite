@@ -4,6 +4,8 @@ struct WorkspaceView: View {
     @EnvironmentObject private var store: VaultStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var confirmDelete: Bool
+    @State private var markdownPreviewScrollTargetID: Int?
+    @State private var sourceScrollTargetOffset: Int?
 
     var body: some View {
         GeometryReader { proxy in
@@ -15,36 +17,85 @@ struct WorkspaceView: View {
                 if store.vaultURL == nil {
                     EmptyVaultView()
                         .transition(.opacity)
-                } else if store.currentFile == nil {
-                    EmptySelectionView()
+                } else if store.workspaceSection == .changes {
+                    GitChangesView(isCompact: isCompact)
+                        .transition(.opacity)
+                } else if store.workspaceSection == .references {
+                    ReferenceWorkspaceView(isCompact: isCompact)
                         .transition(.opacity)
                 } else if isCompact {
-                    VStack(spacing: 0) {
-                        EditorWorkspaceView(confirmDelete: $confirmDelete, isCompact: true)
-
-                        if store.inspectorVisible {
-                            Divider()
-                            InspectorView()
-                                .frame(height: compactInspectorHeight(for: proxy.size.height))
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                        }
-                    }
-                    .transition(.opacity)
+                    workspaceContent(
+                        isCompact: true,
+                        content: compactContent(windowHeight: proxy.size.height)
+                    )
                 } else {
-                    HSplitView {
-                        EditorWorkspaceView(confirmDelete: $confirmDelete, isCompact: false)
-                            .frame(minWidth: 360)
-
-                        if store.inspectorVisible {
-                            InspectorView()
-                                .frame(minWidth: 230, idealWidth: 300, maxWidth: 420)
-                        }
-                    }
-                    .transition(.opacity)
+                    workspaceContent(isCompact: false, content: regularContent)
                 }
             }
             .animation(layoutAnimation, value: isCompact)
             .animation(layoutAnimation, value: store.inspectorVisible)
+            .animation(layoutAnimation, value: store.workspaceSection)
+            .animation(layoutAnimation, value: store.selectedFileID)
+            .animation(layoutAnimation, value: store.openFileTabIDs)
+        }
+    }
+
+    private func workspaceContent<Content: View>(isCompact: Bool, content: Content) -> some View {
+        VStack(spacing: 0) {
+            if store.currentFile == nil {
+                EmptySelectionView()
+                    .transition(.opacity)
+            } else {
+                content
+                    .transition(.opacity)
+            }
+        }
+        .transition(.opacity)
+    }
+
+    private func compactContent(windowHeight: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            EditorWorkspaceView(
+                confirmDelete: $confirmDelete,
+                isCompact: true,
+                markdownScrollTargetID: $markdownPreviewScrollTargetID,
+                sourceScrollTargetOffset: $sourceScrollTargetOffset
+            )
+
+            if store.inspectorVisible {
+                Divider()
+                InspectorView(
+                    markdownScrollTargetID: $markdownPreviewScrollTargetID,
+                    sourceScrollTargetOffset: $sourceScrollTargetOffset
+                )
+                    .frame(height: compactInspectorHeight(for: windowHeight))
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+    }
+
+    private var regularContent: some View {
+        HSplitView {
+            EditorWorkspaceView(
+                confirmDelete: $confirmDelete,
+                isCompact: false,
+                markdownScrollTargetID: $markdownPreviewScrollTargetID,
+                sourceScrollTargetOffset: $sourceScrollTargetOffset
+            )
+            .frame(minWidth: SplitPaneMetrics.mainContentMinWidth, maxWidth: .infinity)
+            .layoutPriority(1)
+
+            if store.inspectorVisible {
+                InspectorView(
+                    markdownScrollTargetID: $markdownPreviewScrollTargetID,
+                    sourceScrollTargetOffset: $sourceScrollTargetOffset
+                )
+                    .frame(
+                        minWidth: SplitPaneMetrics.secondarySidebarMinWidth,
+                        idealWidth: SplitPaneMetrics.secondarySidebarIdealWidth,
+                        maxWidth: SplitPaneMetrics.secondarySidebarMaxWidth
+                    )
+            }
         }
     }
 
@@ -66,11 +117,9 @@ private struct EmptyVaultView: View {
 
             VStack(spacing: 6) {
                 Text(AppBrand.displayName)
-                    .font(AppBrand.monoFont(size: 28, weight: .bold))
+                    .font(.largeTitle.weight(.semibold))
                 Text("Open a vault")
-                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                    .textCase(.uppercase)
-                    .tracking(0.8)
+                    .font(.headline)
                 Text("Choose a folder that contains your notes and project files.")
                     .foregroundStyle(.secondary)
             }
@@ -94,7 +143,7 @@ private struct EmptySelectionView: View {
             BrandLogoView(size: 48)
 
             Text("Select or create a note")
-                .font(AppBrand.monoFont(size: 17, weight: .semibold))
+                .font(.title3.weight(.semibold))
 
             Button {
                 store.createNote()

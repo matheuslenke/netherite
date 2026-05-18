@@ -62,7 +62,7 @@ struct BrandLogoView: View {
         logo
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: size * 0.18, style: .continuous))
-            .shadow(color: Color.purple.opacity(0.28), radius: size * 0.18, y: size * 0.07)
+            .shadow(color: Color.black.opacity(0.10), radius: size * 0.14, y: size * 0.05)
             .accessibilityHidden(true)
     }
 
@@ -79,7 +79,7 @@ struct BrandLogoView: View {
                     .fill(Color(nsColor: .controlBackgroundColor))
                 Image(systemName: "diamond.fill")
                     .font(.system(size: size * 0.46, weight: .semibold))
-                    .foregroundStyle(.purple)
+                    .foregroundStyle(.primary)
             }
         }
     }

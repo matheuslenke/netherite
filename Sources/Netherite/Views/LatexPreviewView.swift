@@ -1,5 +1,3 @@
-import AppKit
-import PDFKit
 import SwiftUI
 
 struct LatexPreviewView: View {
@@ -8,6 +6,8 @@ struct LatexPreviewView: View {
     let render: () -> Void
     let openPDF: () -> Void
     let revealPDF: () -> Void
+    let openIncludedFile: (LatexIncludedFile) -> Void
+    let navigateToSource: (PDFSourceLookupRequest) -> Void
 
     @State private var showsLog = false
 
@@ -51,6 +51,12 @@ struct LatexPreviewView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if !state.includedFiles.isEmpty {
+                    Text("\(state.includedFiles.count) included source\(state.includedFiles.count == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
     }
@@ -120,7 +126,15 @@ struct LatexPreviewView: View {
         case .rendered:
             if let pdfURL = state.pdfURL {
                 VStack(spacing: 0) {
-                    PDFKitPreview(url: pdfURL, renderedAt: state.renderedAt)
+                    IncludedLatexFilesBar(
+                        includedFiles: state.includedFiles,
+                        openIncludedFile: openIncludedFile
+                    )
+                    PDFKitPreview(
+                        url: pdfURL,
+                        reloadToken: state.renderedAt,
+                        onSourceLookup: navigateToSource
+                    )
                     if showsLog {
                         Divider()
                         LatexLogView(log: state.log)
@@ -144,6 +158,10 @@ struct LatexPreviewView: View {
                     systemImage: statusImage,
                     actionTitle: "Render Again",
                     action: render
+                )
+                IncludedLatexFilesBar(
+                    includedFiles: state.includedFiles,
+                    openIncludedFile: openIncludedFile
                 )
                 if !state.log.isEmpty {
                     Divider()
@@ -196,42 +214,60 @@ struct LatexPreviewView: View {
     }
 }
 
-private struct PDFKitPreview: NSViewRepresentable {
-    let url: URL
-    let renderedAt: Date?
+private struct IncludedLatexFilesBar: View {
+    let includedFiles: [LatexIncludedFile]
+    let openIncludedFile: (LatexIncludedFile) -> Void
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
+    var body: some View {
+        if !includedFiles.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Label("\(includedFiles.count)", systemImage: "square.stack.3d.up")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
 
-    func makeNSView(context: Context) -> PDFView {
-        let view = PDFView()
-        view.autoScales = true
-        view.displayMode = .singlePageContinuous
-        view.displayDirection = .vertical
-        view.backgroundColor = .clear
-        view.displaysPageBreaks = true
-        loadDocument(in: view, context: context)
-        return view
-    }
-
-    func updateNSView(_ view: PDFView, context: Context) {
-        guard context.coordinator.url != url || context.coordinator.renderedAt != renderedAt else {
-            return
+                    ForEach(includedFiles) { file in
+                        Button {
+                            openIncludedFile(file)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(file.relativePath)
+                                    .font(.caption.weight(.medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(detailText(for: file))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            .frame(maxWidth: 220, alignment: .leading)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(file.isMissing)
+                        .help(file.isMissing ? "Missing included file" : "Open included source")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .background(.quaternary.opacity(0.18), in: Rectangle())
+            Divider()
         }
-        loadDocument(in: view, context: context)
     }
 
-    private func loadDocument(in view: PDFView, context: Context) {
-        view.document = PDFDocument(url: url)
-        view.autoScales = true
-        context.coordinator.url = url
-        context.coordinator.renderedAt = renderedAt
-    }
+    private func detailText(for file: LatexIncludedFile) -> String {
+        if file.isMissing {
+            return "\\\(file.command) at \(file.sourceRelativePath):\(file.line) - missing"
+        }
 
-    final class Coordinator {
-        var url: URL?
-        var renderedAt: Date?
+        var parts = ["\\\(file.command) at line \(file.line)"]
+        if let wordCount = file.wordCount {
+            parts.append("\(wordCount) words")
+        }
+        if let byteCount = file.byteCount {
+            parts.append(ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file))
+        }
+        return parts.joined(separator: " - ")
     }
 }
 

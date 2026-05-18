@@ -5,7 +5,7 @@ A native macOS note-taking app for folder-based writing vaults.
 ## Features
 
 - Opens a vault folder that contains notes, folders, git metadata, and `.netherite/config.json`.
-- Reads Markdown, plain text, code, CSV/TSV, JSON/YAML/TOML, RTF/HTML/DOCX via text extraction, PDFs via PDF text extraction, images as metadata text, and binary files as hex previews.
+- Reads Markdown, plain text, code, CSV/TSV, JSON/YAML/TOML, RTF/HTML/DOCX via text extraction, PDFs with in-app preview plus text extraction, images as metadata text, and binary files as hex previews.
 - Provides Original, Preview, and Split modes for Markdown and source text.
 - Edits LaTeX project files and renders `.tex` roots to an in-app PDF preview with `latexmk`, including multi-file projects with bibliographies and assets.
 - Adapts the editor, preview, and inspector for smaller windows, with a subtle optional workspace tint.

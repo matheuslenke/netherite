@@ -1,6 +1,7 @@
 import SwiftUI
 
 private enum InspectorTab: String, CaseIterable, Identifiable {
+    case contents
     case metadata
     case latex
     case history
@@ -9,6 +10,8 @@ private enum InspectorTab: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .contents:
+            "Contents"
         case .metadata:
             "Meta"
         case .latex:
@@ -20,6 +23,8 @@ private enum InspectorTab: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
+        case .contents:
+            "list.bullet.indent"
         case .metadata:
             "info.circle"
         case .latex:
@@ -33,7 +38,10 @@ private enum InspectorTab: String, CaseIterable, Identifiable {
 struct InspectorView: View {
     @EnvironmentObject private var store: VaultStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var selectedTab: InspectorTab = .metadata
+    @Binding var markdownScrollTargetID: Int?
+    @Binding var sourceScrollTargetOffset: Int?
+    @State private var selectedTab: InspectorTab = .contents
+    @State private var selectedTableOfContentsItemID: Int?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -48,19 +56,23 @@ struct InspectorView: View {
             Divider()
             gitFooter
         }
-        .glassEffect(.regular, in: Rectangle())
+        .background(Color(nsColor: .controlBackgroundColor), in: Rectangle())
         .animation(contentAnimation, value: selectedTab)
         .animation(contentAnimation, value: store.gitSnapshot.statusText)
+        .animation(contentAnimation, value: store.gitChanges.count)
         .animation(contentAnimation, value: store.gitHistory.count)
         .animation(contentAnimation, value: store.latexRenderState.phase)
+        .onChange(of: store.currentFile?.id) { _, _ in
+            selectedTab = .contents
+            selectedTableOfContentsItemID = nil
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
-                Label("DETAILS", systemImage: selectedTab.systemImage)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                Label("Inspector", systemImage: selectedTab.systemImage)
+                    .font(.headline.weight(.semibold))
 
                 Spacer(minLength: 8)
 
@@ -84,22 +96,97 @@ struct InspectorView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+        .background(.regularMaterial, in: Rectangle())
     }
 
     private var tabContent: some View {
-        GlassEffectContainer(spacing: 14) {
-            VStack(alignment: .leading, spacing: 14) {
-                switch selectedTab {
-                case .metadata:
-                    documentSection
-                    backlinksSection
-                    agentSection
-                case .latex:
-                    latexTab
-                case .history:
-                    historySection
+        VStack(alignment: .leading, spacing: 14) {
+            switch selectedTab {
+            case .contents:
+                contentsTab
+            case .metadata:
+                documentSection
+                backlinksSection
+                agentSection
+            case .latex:
+                latexTab
+            case .history:
+                historySection
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var contentsTab: some View {
+        if store.currentFile?.kind == .markdown || store.currentFile?.kind == .latex {
+            if tableOfContentsItems.isEmpty {
+                EmptyInspectorState(
+                    title: "No Headings",
+                    message: "Add document headings to build the contents.",
+                    systemImage: "list.bullet.indent"
+                )
+            } else {
+                MarkdownTableOfContentsView(
+                    items: tableOfContentsItems,
+                    selectedItemID: selectedTableOfContentsItemID,
+                    isCompact: false
+                ) { item in
+                    selectedTableOfContentsItemID = item.id
+                    jumpToContentsItem(item)
                 }
             }
+        } else {
+            EmptyInspectorState(
+                title: store.currentFile == nil ? "No Document" : "No Contents",
+                message: store.currentFile == nil ? "Select a markdown or LaTeX document to show its contents." : "Contents are available for markdown and LaTeX documents.",
+                systemImage: "doc.text.magnifyingglass"
+            )
+        }
+    }
+
+    private var tableOfContentsItems: [MarkdownTableOfContentsItem] {
+        switch store.currentFile?.kind {
+        case .markdown:
+            markdownTableOfContentsItems
+        case .latex:
+            LatexStructureItem.parse(store.documentText).map { item in
+                MarkdownTableOfContentsItem(
+                    id: item.sourceStartOffset,
+                    level: item.level,
+                    title: item.title
+                )
+            }
+        default:
+            []
+        }
+    }
+
+    private var markdownTableOfContentsItems: [MarkdownTableOfContentsItem] {
+        MarkdownBlock.parse(store.documentText).compactMap { block in
+            guard case let .heading(level) = block.kind else { return nil }
+
+            let title = block.text.trimmed
+            guard !title.isEmpty else { return nil }
+
+            return MarkdownTableOfContentsItem(
+                id: block.sourceStartOffset,
+                level: level,
+                title: title
+            )
+        }
+    }
+
+    private func jumpToContentsItem(_ item: MarkdownTableOfContentsItem) {
+        switch store.currentFile?.kind {
+        case .markdown:
+            markdownScrollTargetID = item.id
+        case .latex:
+            if store.editorMode == .preview {
+                store.setEditorMode(.split)
+            }
+            sourceScrollTargetOffset = item.id
+        default:
+            break
         }
     }
 
@@ -147,6 +234,7 @@ struct InspectorView: View {
             VStack(alignment: .leading, spacing: 10) {
                 metadataRow("Status", latexStatusText)
                 metadataRow("Root", store.latexRenderState.rootRelativePath ?? store.currentFile?.relativePath ?? "Unknown")
+                metadataRow("Includes", "\(store.latexRenderState.includedFiles.count)")
 
                 ViewThatFits(in: .horizontal) {
                     HStack {
@@ -162,6 +250,10 @@ struct InspectorView: View {
                     }
                 }
 
+                if !store.latexRenderState.includedFiles.isEmpty {
+                    includedLatexFiles
+                }
+
                 if !store.latexRenderState.log.isEmpty {
                     Text(store.latexRenderState.log)
                         .font(.system(size: 11, design: .monospaced))
@@ -174,6 +266,45 @@ struct InspectorView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var includedLatexFiles: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Included Files")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ForEach(store.latexRenderState.includedFiles) { file in
+                Button {
+                    openIncludedLatexFile(file)
+                } label: {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: file.isMissing ? "exclamationmark.triangle" : "doc.text")
+                            .foregroundStyle(file.isMissing ? .orange : .secondary)
+                            .frame(width: 14)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(file.relativePath)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(includedLatexFileDetail(file))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+
+                        Spacer(minLength: 4)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(file.isMissing)
+                .help(file.isMissing ? "Missing included file" : "Open included source")
+            }
+        }
+        .font(.caption)
+        .padding(8)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var historySection: some View {
@@ -257,7 +388,7 @@ struct InspectorView: View {
                 } else {
                     ForEach(store.backlinks) { file in
                         Button {
-                            store.selectFile(id: file.id)
+                            store.openFile(file.id)
                         } label: {
                             Label(file.relativePath, systemImage: file.kind.systemImage)
                                 .lineLimit(1)
@@ -292,6 +423,10 @@ struct InspectorView: View {
                 }
 
                 if store.gitSnapshot.isRepository {
+                    gitIconButton("Show Git Changes", systemImage: "point.3.connected.trianglepath.dotted", disabled: false) {
+                        store.showGitChanges()
+                    }
+
                     gitIconButton("Pull", systemImage: "arrow.down.circle", disabled: false) {
                         store.pullVault()
                     }
@@ -427,7 +562,7 @@ struct InspectorView: View {
 
     private var gitChangeSummary: String {
         guard store.gitSnapshot.isRepository else { return "" }
-        let changeCount = store.gitSnapshot.statusText.split(whereSeparator: \.isNewline).count
+        let changeCount = store.gitChanges.count
         return changeCount == 0 ? "Clean" : "\(changeCount) changes"
     }
 
@@ -444,6 +579,39 @@ struct InspectorView: View {
         case .unavailable:
             "Tool unavailable"
         }
+    }
+
+    private func openIncludedLatexFile(_ includedFile: LatexIncludedFile) {
+        guard !includedFile.isMissing,
+              let url = includedFile.url,
+              let fileID = store.fileID(for: url)
+        else {
+            store.statusMessage = "Included file is not available in this vault."
+            return
+        }
+
+        store.openFile(fileID)
+        store.setEditorMode(.split)
+        sourceScrollTargetOffset = nil
+        store.statusMessage = "Opened \(includedFile.relativePath)"
+    }
+
+    private func includedLatexFileDetail(_ file: LatexIncludedFile) -> String {
+        if file.isMissing {
+            return "\\\(file.command) at \(file.sourceRelativePath):\(file.line) - missing"
+        }
+
+        var parts = ["\\\(file.command) at \(file.sourceRelativePath):\(file.line)"]
+        if let lineCount = file.lineCount {
+            parts.append("\(lineCount) lines")
+        }
+        if let wordCount = file.wordCount {
+            parts.append("\(wordCount) words")
+        }
+        if let byteCount = file.byteCount {
+            parts.append(ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file))
+        }
+        return parts.joined(separator: " - ")
     }
 
     private func metadataRow(_ label: String, _ value: String) -> some View {
@@ -485,6 +653,181 @@ private struct EmptyInspectorState: View {
         }
         .frame(maxWidth: .infinity, minHeight: 180)
         .padding(18)
+    }
+}
+
+private struct LatexStructureItem {
+    let sourceStartOffset: Int
+    let command: String
+    let title: String
+
+    var level: Int {
+        switch command {
+        case "part", "chapter":
+            1
+        case "section":
+            2
+        case "subsection":
+            3
+        case "subsubsection":
+            4
+        case "paragraph":
+            5
+        case "subparagraph":
+            6
+        default:
+            6
+        }
+    }
+
+    static func parse(_ source: String) -> [LatexStructureItem] {
+        var items: [LatexStructureItem] = []
+        var lineStartOffset = 0
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+
+        for (index, line) in lines.enumerated() {
+            let lineText = String(line)
+            if let item = parseLine(lineText, lineStartOffset: lineStartOffset) {
+                items.append(item)
+            }
+            lineStartOffset += lineText.count + (index == lines.count - 1 ? 0 : 1)
+        }
+
+        return items
+    }
+
+    private static func parseLine(_ line: String, lineStartOffset: Int) -> LatexStructureItem? {
+        let commands = [
+            "subparagraph",
+            "subsubsection",
+            "subsection",
+            "paragraph",
+            "chapter",
+            "section",
+            "part"
+        ]
+
+        for command in commands {
+            guard let commandRange = line.range(of: "\\\(command)") else { continue }
+            guard commandIsContent(at: commandRange.lowerBound, in: line) else { continue }
+
+            var cursor = commandRange.upperBound
+            if cursor < line.endIndex, line[cursor] == "*" {
+                cursor = line.index(after: cursor)
+            }
+
+            cursor = skipWhitespace(from: cursor, in: line)
+            if cursor < line.endIndex, line[cursor] == "[" {
+                guard let optionalEnd = closingDelimiterIndex(
+                    from: cursor,
+                    open: "[",
+                    close: "]",
+                    in: line
+                ) else {
+                    continue
+                }
+                cursor = skipWhitespace(from: line.index(after: optionalEnd), in: line)
+            }
+
+            guard cursor < line.endIndex, line[cursor] == "{",
+                  let titleEnd = closingDelimiterIndex(from: cursor, open: "{", close: "}", in: line)
+            else {
+                continue
+            }
+
+            let titleStart = line.index(after: cursor)
+            let rawTitle = String(line[titleStart..<titleEnd])
+            let title = cleanedTitle(rawTitle)
+            guard !title.isEmpty else { continue }
+
+            let offset = line.distance(from: line.startIndex, to: commandRange.lowerBound)
+            return LatexStructureItem(
+                sourceStartOffset: lineStartOffset + offset,
+                command: command,
+                title: title
+            )
+        }
+
+        return nil
+    }
+
+    private static func commandIsContent(at index: String.Index, in line: String) -> Bool {
+        guard !isEscaped(index, in: line) else { return false }
+
+        if let commentIndex = unescapedCommentIndex(in: line), commentIndex < index {
+            return false
+        }
+
+        return true
+    }
+
+    private static func unescapedCommentIndex(in line: String) -> String.Index? {
+        var index = line.startIndex
+        while index < line.endIndex {
+            if line[index] == "%", !isEscaped(index, in: line) {
+                return index
+            }
+            index = line.index(after: index)
+        }
+        return nil
+    }
+
+    private static func isEscaped(_ index: String.Index, in line: String) -> Bool {
+        guard index > line.startIndex else { return false }
+
+        var slashCount = 0
+        var cursor = line.index(before: index)
+        while true {
+            guard line[cursor] == "\\" else { break }
+            slashCount += 1
+            guard cursor > line.startIndex else { break }
+            cursor = line.index(before: cursor)
+        }
+
+        return slashCount % 2 == 1
+    }
+
+    private static func skipWhitespace(from startIndex: String.Index, in line: String) -> String.Index {
+        var cursor = startIndex
+        while cursor < line.endIndex, line[cursor].isWhitespace {
+            cursor = line.index(after: cursor)
+        }
+        return cursor
+    }
+
+    private static func closingDelimiterIndex(
+        from openIndex: String.Index,
+        open: Character,
+        close: Character,
+        in line: String
+    ) -> String.Index? {
+        var depth = 0
+        var cursor = openIndex
+
+        while cursor < line.endIndex {
+            let character = line[cursor]
+            if character == open, !isEscaped(cursor, in: line) {
+                depth += 1
+            } else if character == close, !isEscaped(cursor, in: line) {
+                depth -= 1
+                if depth == 0 {
+                    return cursor
+                }
+            }
+
+            cursor = line.index(after: cursor)
+        }
+
+        return nil
+    }
+
+    private static func cleanedTitle(_ rawTitle: String) -> String {
+        rawTitle
+            .replacingOccurrences(of: #"\\([A-Za-z]+)\{([^{}]*)\}"#, with: "$2", options: .regularExpression)
+            .replacingOccurrences(of: #"\\[A-Za-z]+\*?"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[\{\}]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"~"#, with: " ")
+            .trimmed
     }
 }
 

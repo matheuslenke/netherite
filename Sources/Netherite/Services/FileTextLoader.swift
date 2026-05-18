@@ -1,38 +1,78 @@
 import Foundation
 import ImageIO
-import PDFKit
 
-struct LoadedDocument {
+struct LoadedDocument: Sendable {
     let text: String
     let sourceDescription: String
     let isEditable: Bool
 }
 
 enum FileTextLoader {
-    static func load(url: URL) throws -> LoadedDocument {
-        let data = try Data(contentsOf: url)
-        let kind = FileKind(fileExtension: url.pathExtension)
+    private static let binaryPreviewByteLimit = 16_384
 
-        if data.isEmpty {
-            return LoadedDocument(text: "", sourceDescription: "Empty text file", isEditable: true)
+    static func load(url: URL) throws -> LoadedDocument {
+        let kind = FileKind(fileExtension: url.pathExtension)
+        let byteCount = fileSize(at: url)
+
+        if url.pathExtension.lowercased() == "pdf" {
+            return LoadedDocument(
+                text: documentDescription(url: url, byteCount: byteCount, label: "PDF"),
+                sourceDescription: "PDF preview; source file is read-only here",
+                isEditable: false
+            )
         }
 
-        if url.pathExtension.lowercased() == "pdf",
-           let pdfText = extractPDFText(url: url),
-           !pdfText.trimmed.isEmpty {
+        if kind == .spreadsheet {
             return LoadedDocument(
-                text: pdfText,
-                sourceDescription: "Extracted PDF text; source file is read-only here",
+                text: spreadsheetDescription(url: url, byteCount: byteCount),
+                sourceDescription: "Excel workbook preview; source file is read-only here",
                 isEditable: false
             )
         }
 
         if kind == .image {
             return LoadedDocument(
-                text: imageDescription(url: url, byteCount: data.count),
+                text: imageDescription(url: url, byteCount: byteCount),
                 sourceDescription: "Image metadata rendered as text; source file is read-only here",
                 isEditable: false
             )
+        }
+
+        if kind == .richText || kind == .document {
+            if let converted = try? convertWithTextUtil(url: url), !converted.trimmed.isEmpty {
+                return LoadedDocument(
+                    text: converted,
+                    sourceDescription: "Extracted with textutil; source file is read-only here",
+                    isEditable: false
+                )
+            }
+
+            return LoadedDocument(
+                text: documentDescription(
+                    url: url,
+                    byteCount: byteCount,
+                    label: kind == .richText ? "Rich Text" : "Document"
+                ),
+                sourceDescription: "Document metadata; source file is read-only here",
+                isEditable: false
+            )
+        }
+
+        if kind == .binary, byteCount > binaryPreviewByteLimit {
+            let sample = try readPrefix(url: url, byteLimit: binaryPreviewByteLimit)
+            if !looksLikeText(data: sample) {
+                return LoadedDocument(
+                    text: hexDump(data: sample, totalByteCount: byteCount),
+                    sourceDescription: "Binary preview as hexadecimal text; source file is read-only here",
+                    isEditable: false
+                )
+            }
+        }
+
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+
+        if data.isEmpty {
+            return LoadedDocument(text: "", sourceDescription: "Empty text file", isEditable: true)
         }
 
         if let string = decodeText(data: data) {
@@ -48,7 +88,7 @@ enum FileTextLoader {
         }
 
         return LoadedDocument(
-            text: hexDump(data: data),
+            text: hexDump(data: data, totalByteCount: byteCount),
             sourceDescription: "Binary preview as hexadecimal text; source file is read-only here",
             isEditable: false
         )
@@ -111,17 +151,16 @@ enum FileTextLoader {
         return result.output
     }
 
-    private static func extractPDFText(url: URL) -> String? {
-        guard let document = PDFDocument(url: url) else { return nil }
+    private static func fileSize(at url: URL) -> Int {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+    }
 
-        var pages: [String] = []
-        for index in 0..<document.pageCount {
-            if let text = document.page(at: index)?.string?.trimmed, !text.isEmpty {
-                pages.append("Page \(index + 1)\n\n\(text)")
-            }
+    private static func readPrefix(url: URL, byteLimit: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer {
+            try? handle.close()
         }
-
-        return pages.joined(separator: "\n\n---\n\n")
+        return try handle.read(upToCount: byteLimit) ?? Data()
     }
 
     private static func imageDescription(url: URL, byteCount: Int) -> String {
@@ -146,7 +185,24 @@ enum FileTextLoader {
         return lines.joined(separator: "\n")
     }
 
-    private static func hexDump(data: Data) -> String {
+    private static func documentDescription(url: URL, byteCount: Int, label: String) -> String {
+        [
+            "\(label): \(url.lastPathComponent)",
+            "Size: \(ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file))",
+            "Path: \(url.path)"
+        ].joined(separator: "\n")
+    }
+
+    private static func spreadsheetDescription(url: URL, byteCount: Int) -> String {
+        [
+            "Spreadsheet: \(url.lastPathComponent)",
+            "Format: \(url.pathExtension.uppercased())",
+            "Size: \(ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file))",
+            "Path: \(url.path)"
+        ].joined(separator: "\n")
+    }
+
+    private static func hexDump(data: Data, totalByteCount: Int) -> String {
         let bytes = Array(data.prefix(16_384))
         var lines: [String] = []
 
@@ -165,9 +221,9 @@ enum FileTextLoader {
             lines.append(String(format: "%08x  %@  %@", offset, hex, String(ascii)))
         }
 
-        if data.count > bytes.count {
+        if totalByteCount > bytes.count {
             lines.append("")
-            lines.append("Preview truncated at \(bytes.count) bytes of \(data.count) total bytes.")
+            lines.append("Preview truncated at \(bytes.count) bytes of \(totalByteCount) total bytes.")
         }
 
         return lines.joined(separator: "\n")
